@@ -18,7 +18,10 @@
 **ktOperator** is a secure, multi-provider AI agent that lives in your terminal. You describe a task in plain language — *“analyze this project”*, *“run the tests and fix what breaks”* — and it plans, reads, writes and executes **inside a workspace you explicitly authorize**, behind a policy engine that is completely independent of the model.
 
 ```bash
-ktoperator        # interactive console: provider → API key → model → chatbox
+ktoperator
+```
+
+```bash       # interactive console: provider → API key → model → chatbox
 operator run "Analyze this project and explain its architecture"
 operator plan "Run the tests and summarize the failures"   # plan only, executes nothing
 ```
