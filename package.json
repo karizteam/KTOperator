@@ -1,6 +1,6 @@
 {
-  "name": "ktoperator",
-  "version": "0.3.0",
+  "name": "@karizteam/operator",
+  "version": "0.4.0",
   "description": "ktOperator — a secure, multi-provider AI operating-system agent with an interactive console",
   "license": "MIT",
   "type": "module",

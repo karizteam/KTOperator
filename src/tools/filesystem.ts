@@ -465,8 +465,18 @@ export const createFileTool: Tool = {
     if (ctx.dryRun) return { ok: true, summary: `[dry-run] would create ${rel} (${content.length} bytes).` };
     if (resolved.kind === 'file') await ctx.backups.backup(ctx.sessionId, resolved.realPath, 'edit', { audit: ctx.audit });
     else await ctx.backups.backup(ctx.sessionId, resolved.realPath, 'create', { audit: ctx.audit });
+    // Writing creates missing parent folders — remember which one is new so the
+    // run summary can report it to the user.
+    let newFolder: string | null = null;
+    if (resolved.kind !== 'file' && !(await fs.access(path.dirname(resolved.realPath)).then(() => true, () => false))) {
+      const dirRel = path.dirname(rel).replace(/\\/g, '/');
+      if (dirRel !== '.' && dirRel !== '') newFolder = dirRel;
+    }
     await writeVerified(resolved.realPath, content, rel);
-    return { ok: true, summary: `${resolved.kind === 'file' ? 'Overwrote' : 'Created'} ${rel} (${content.length} bytes), verified after write.` };
+    return {
+      ok: true,
+      summary: `${resolved.kind === 'file' ? 'Overwrote' : 'Created'} ${rel} (${content.length} bytes), verified after write.${newFolder !== null ? ` [new folder: ${newFolder}]` : ''}`,
+    };
   },
 };
 

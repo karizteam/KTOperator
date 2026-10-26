@@ -35,7 +35,12 @@ export interface AgentLoopOptions {
 
 export interface AgentStep {
   iteration: number;
-  toolCalls: { name: string; ok: boolean; summary: string }[];
+  /**
+   * What this step actually did. `args` is a compact copy of the call
+   * arguments (long strings capped) — enough for the run summary to report
+   * the paths, apps and commands that changed without re-reading the session.
+   */
+  toolCalls: { name: string; ok: boolean; summary: string; args: Record<string, unknown> }[];
   assistantText: string;
 }
 
@@ -162,11 +167,11 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentRepo
           const toolMsg: ChatMessage = { role: 'tool', toolCallId: call.id, name: call.name, content: options.registry.renderForModel(call.name, toolResult) };
           messages.push(toolMsg);
           options.onMessage?.(toolMsg);
-          step.toolCalls.push({ name: call.name, ok: false, summary: toolResult.summary });
+          step.toolCalls.push({ name: call.name, ok: false, summary: toolResult.summary, args: compactArgs(call.arguments) });
           return report('limit', { limitReason: 'Three actions were denied; stopping instead of pushing against the security policy.' });
         }
         options.onToolEvent?.({ type: 'done', name: call.name, ok: toolResult.ok, summary: toolResult.summary });
-        step.toolCalls.push({ name: call.name, ok: toolResult.ok, summary: toolResult.summary });
+        step.toolCalls.push({ name: call.name, ok: toolResult.ok, summary: toolResult.summary, args: compactArgs(call.arguments) });
         const toolMsg: ChatMessage = {
           role: 'tool',
           toolCallId: call.id,
@@ -208,6 +213,36 @@ function trimContext(messages: ChatMessage[]): void {
       m.content = `${m.content.slice(0, 2000)}\n[older tool output truncated to keep the context within limits]`;
     }
   }
+}
+
+/**
+ * A small, size-bounded copy of a tool call's JSON arguments, kept on the step
+ * so the run summary can list changed paths/apps/commands. File contents are
+ * capped, so a 2 MB `create_file` never lands in the session report.
+ */
+function compactArgs(rawArguments: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawArguments);
+  } catch {
+    return {};
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  return compactValue(parsed, 0) as Record<string, unknown>;
+}
+
+const MAX_ARG_STRING = 240;
+const MAX_ARG_ITEMS = 30;
+const MAX_ARG_DEPTH = 3;
+
+function compactValue(value: unknown, depth: number): unknown {
+  if (typeof value === 'string') return value.length > MAX_ARG_STRING ? `${value.slice(0, MAX_ARG_STRING)}…` : value;
+  if (value === null || typeof value !== 'object') return value;
+  if (depth >= MAX_ARG_DEPTH) return '[…]';
+  if (Array.isArray(value)) return value.slice(0, MAX_ARG_ITEMS).map((v) => compactValue(v, depth + 1));
+  const out: Record<string, unknown> = {};
+  for (const [key, v] of Object.entries(value)) out[key] = compactValue(v, depth + 1);
+  return out;
 }
 
 function stableStringify(s: string): string {

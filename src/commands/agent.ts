@@ -1,8 +1,10 @@
 import { ConfigError, OperatorError } from '../errors/errors.js';
 import { buildSystemPrompt } from '../core/agent/system-prompt.js';
 import { runAgentLoop } from '../core/agent/loop.js';
+import { collectRunChanges, renderChangesBox } from '../core/agent/changes.js';
 import { buildPlan, type Plan } from '../core/planner/planner.js';
 import { DEFAULT_KEY_ENV } from '../config/credentials.js';
+import { VERSION } from '../version.js';
 import type { Runtime } from './runtime.js';
 
 export function NotFoundOrEmpty(message: string): OperatorError {
@@ -79,7 +81,7 @@ export async function runTask(rt: Runtime, task: string, flags: AgentCommandFlag
   const limits = rt.config.limits;
 
   if (!rt.ui.jsonMode) {
-    await rt.ui.splashScreen('0.3.0');
+    await rt.ui.splashScreen(VERSION);
     rt.ui.step(`Provider: ${rt.ui.brandBold(stack.providerLabel)}, model: ${rt.ui.brandLight(stack.model)}`);
     rt.ui.step(`Sandbox: ${rt.ui.brandLight(stack.sandbox.selectedId() ?? 'NONE (execution tools will fail safely)')}`);
     if (flags.dryRun) rt.ui.warn('Dry-run mode: nothing will be modified.');
@@ -136,6 +138,7 @@ export async function runTask(rt: Runtime, task: string, flags: AgentCommandFlag
     },
   });
 
+  const changes = collectRunChanges(report.steps);
   const summary = {
     sessionId: stack.sessionId,
     status: report.status,
@@ -146,10 +149,12 @@ export async function runTask(rt: Runtime, task: string, flags: AgentCommandFlag
     usage: report.usage,
     durationMs: report.durationMs,
     steps: report.steps.map((s) => s.toolCalls),
+    changes,
   };
   rt.ui.emit({ ...summary, finalText: report.finalText }, () => '');
 
   if (!rt.ui.jsonMode) {
+    renderChangesBox(rt.ui, changes);
     rt.ui.info('');
     const statusColor = report.status === 'completed' ? rt.ui.green.bind(rt.ui) : rt.ui.yellow.bind(rt.ui);
     rt.ui.info(rt.ui.bold(`Session ${report.status === 'completed' ? 'completed' : `ended: ${report.status}`}`));

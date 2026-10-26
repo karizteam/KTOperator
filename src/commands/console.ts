@@ -9,6 +9,7 @@ import { createToolRegistry } from '../tools/index.js';
 import type { ToolContext } from '../tools/types.js';
 import { buildSystemPrompt } from '../core/agent/system-prompt.js';
 import { runAgentLoop } from '../core/agent/loop.js';
+import { collectRunChanges, renderChangesBox } from '../core/agent/changes.js';
 import { VERSION } from '../version.js';
 import { BRAND_HEX, displayWidth, truncateToWidth } from '../cli/ui.js';
 import type { SandboxManager } from '../sandbox/manager.js';
@@ -846,6 +847,7 @@ async function runConsoleTask(rt: Runtime, deps: TaskDeps): Promise<void> {
   if (report.status !== 'completed') {
     rt.ui.warn(`${report.status}${report.limitReason ? `: ${report.limitReason}` : ''}`);
   }
+  renderChangesBox(rt.ui, collectRunChanges(report.steps));
   if (report.toolCallsTotal > 0) {
     const sep = rt.ui.brandDark(' · ');
     const tools = `${report.toolCallsTotal} tool call${report.toolCallsTotal === 1 ? '' : 's'}`;
