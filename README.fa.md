@@ -40,7 +40,7 @@ operator plan "آزمون‌ها را اجرا کن و خطاها را خلاص�
 ## 🚀 نصب
 
 ```bash
-npm i @karizteam/operator
+npm i -g @karizteam/operator
 ```
 
 این بسته ابزارهای خط فرمان `ktoperator` و `operator` را نصب می‌کند.
