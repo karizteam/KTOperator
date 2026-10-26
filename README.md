@@ -2,7 +2,7 @@
 
 # 🜂 ktOperator
 
-[![version](https://img.shields.io/badge/version-0.4.0-8B9A6E?style=flat-square)](https://www.npmjs.com/package/ktoperator)
+[![version](https://img.shields.io/badge/version-0.4.0-8B9A6E?style=flat-square)](https://www.npmjs.com/package/@karizteam/operator)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.12-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
 [![tests](https://img.shields.io/badge/tests-263%20passing-success?style=flat-square)](#-development)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
