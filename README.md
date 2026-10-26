@@ -38,7 +38,7 @@ operator plan "Run the tests and summarize the failures"   # plan only, executes
 ## 🚀 Install
 
 ```bash
-npm i ktOperator        # installs `ktoperator` and `operator`
+npm i @karizteam/operator       
 ```
 
 Node.js **22.12+**. Docker (optional) enables the strongest sandbox.
