@@ -13,9 +13,10 @@ Guiding principle: **the AI decides what it wants to do; Operator's security eng
 | Path traversal / absolute-path escapes | Lexical + filesystem-level containment tests; `..` and drive-absolute handled cross-platform |
 | Device files / FIFOs / sockets | Only regular files and directories are resolvable |
 | Huge files / unbounded recursion | `limits.maxFileBytes`, walk depth 8, 20k visited-entry cap, per-tool result caps |
-| Model-generated shell strings | argv-only execution; shell interpreter names refused at the tool layer and in the sandbox |
+| Model-generated shell strings | argv-only execution; shell interpreter names refused at the tool layer and in the sandbox. The single exception is `run_shell_command`, which is tier 3, needs the user's approval for every command, and cannot run at all non-interactively |
 | Malicious npm scripts | Only pre-existing package.json scripts run, named allowlist (test/typecheck/lint/build), inside the sandbox |
-| Sandbox unavailable | Execution is **refused** with diagnostics — no silent downgrade |
+| Sandbox unavailable | Sandboxed execution is **refused** with diagnostics — no silent downgrade. `run_shell_command` is host-level by design and therefore does not depend on a sandbox, which is exactly why it is never automatic |
+| Secrets reaching a shell command | `run_shell_command` hands the child an environment allowlist (PATH, SystemRoot, TEMP, …) and drops every name matching key/token/secret/password/credential/auth/session/cookie |
 | Prompt injection via files/README/command output | Untrusted-output delimiters + injection phrase screening + policy enforcement regardless of content |
 | Secret exfiltration through the context window | Pattern-based redaction of keys/tokens/PEM blocks on all model-visible tool output |
 | API key leakage via logs/errors | Redaction on audit, error details, `config show`; keys never printed by any command |

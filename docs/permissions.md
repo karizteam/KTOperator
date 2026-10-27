@@ -12,9 +12,10 @@ Approvals can come only from the interactive user prompt or an explicit
 | 3 — privileged/external | Command execution, builds, installs | Per-operation approval in a terminal; `--yes all` required otherwise; audited loudly |
 
 Hard denials (no approval can override): any path outside the workspace and
-outside every folder the user granted read-only access to, shell interpreters
-as executables, admin/root execution, exposing the container-runtime socket
-to the sandbox.
+outside every folder the user granted access to (writes only inside a folder
+with a write grant), shell interpreters as executables or desktop apps,
+admin/root execution, terminating system-critical or Operator processes,
+exposing the container-runtime socket to the sandbox.
 
 ## Tool classification
 
@@ -25,16 +26,40 @@ to the sandbox.
 | get_operating_system, get_runtime_versions, get_cpu_summary, get_memory_summary, get_disk_usage, get_process_summary | 0 | Read-only system views; process LIST only |
 | inspect_command_result | 0 | Operator-managed processes only |
 | web_search, web_fetch | 0 | Public internet, read-only; every URL and redirect hop validated (http(s), no credentials, standard ports, never a private/loopback address); output capped |
-| create_file | 1 → 2 | Escalates to 2 when overwriting an existing file |
-| edit_file | 1 | Exact-match edits; atomic; diff returned |
-| move_file | 1 → 2 | Escalates when overwriting destination; both ends must be in-workspace |
-| delete_file | 2 | Single files only; snapshot first; no recursive deletion by design |
+| create_file | 1 → 2 | Escalates to 2 when overwriting an existing file; also allowed in a folder with a write grant |
+| edit_file | 1 | Exact-match edits; atomic; diff returned; also allowed in a folder with a write grant |
+| move_file | 1 → 2 | Escalates when overwriting destination; both ends must be in the same writable place |
+| delete_file | 2 | Single files only; snapshot first; no recursive deletion by design; also allowed in a folder with a write grant |
 | terminate_managed_process | 2 | Only Operator-managed ids |
+| close_app | 2 → 3 | Closes a running application/process by name or pid after approval (escalates to 3 with `force`); never system-critical pids or Operator's own process tree |
 | run_tests, run_typecheck, run_linter, run_build | 3 | Existing npm scripts only; sandboxed; network per config |
 | execute_approved_command | 3 | argv-only; no shells; sandboxed |
-| request_path_access | 3 | Read-only grant for one folder outside the workspace; per-path approval, session scope, never covers writes |
-| launch_app | 3 | Fixed app catalog only (chrome, edge, firefox, notepad, explorer, calculator, paint, vscode, Microsoft Store); no shell, no arbitrary executable, no installs |
+| run_shell_command | 3 | A real command line (cmd / bash / PowerShell) on the user's own machine; the exact command, shell, directory and any warning are shown before approval; per-command approval only, never a session grant, impossible without an interactive prompt (or an explicit `--yes all`) |
+| request_path_access | 3 | Grant for one folder or drive outside the workspace; per-path approval, session scope. Read-only by default; `write: true` (a separate user decision) also allows create/edit/move/delete there, each still approved individually |
+| launch_app | 3 | Opens any application installed on the machine — the catalog (chrome, edge, firefox, notepad, explorer, calculator, paint, vscode, Microsoft Store) plus anything found in the Start Menu, the Applications folders, .desktop entries or PATH. Shells, script hosts and terminals are refused; no installs, no downloads |
 | open_url | 3 | http(s) only, no embedded credentials; opens in the user's browser (default, chrome, edge, firefox) |
+
+### Natural language into a real command
+
+When the user asks for something "in cmd" or "in bash" — or describes an
+operating-system task in words ("show my IP", "how much free space is left",
+"what is using port 3000", "list the biggest files here") — the agent writes the
+command that does it and calls `run_shell_command`. Nothing executes until the
+user approves that exact text in the tier-3 prompt, which shows:
+
+- the command, verbatim, and the shell that will run it (`cmd.exe`,
+  PowerShell, bash or sh);
+- the working directory (the workspace) and the timeout;
+- plain warnings when the command looks destructive (recursive delete, disk
+  formatting, registry edits, a download piped into a shell, an install, an
+  administrator escalation …).
+
+By design this is the only place a shell runs on the host: standard project
+work stays on `execute_approved_command` (argv-only, sandboxed), and the
+sandbox itself still refuses interpreters. The command runs with a filtered
+environment (no API keys are inherited), capped and redacted output, and a
+killable process tree — a still-running command is stopped with
+`terminate_managed_process` using the id it returns.
 
 ## Approval prompt contents
 
@@ -52,35 +77,49 @@ does not push against the security policy.
 
 ## Dynamic access outside the workspace
 
-The workspace is the only place the agent may **write**. Reading is dynamic:
-when the user points at another location — "check drive C", "look at
-D:\projects\shop", "/etc" — the agent calls `request_path_access` with that
-absolute path, and the normal tier-3 prompt asks the user to approve it. One
-approval and the read tools (`list_directory`, `read_file`, `search_files`,
-`search_text`, `inspect_file_metadata`, `generate_diff`, `get_disk_usage`)
-work there for the rest of the session.
+Access outside the workspace is dynamic and always user-approved: when the
+user points at another location — "check drive C", "look at D:\projects\shop",
+"/etc" — the agent calls `request_path_access` with that absolute path, and
+the normal tier-3 prompt asks the user to approve it. A bare drive letter is
+written as `C` or `C:\` and means that drive's root.
+
+**Read (default).** One approval and `list_directory`, `read_file`,
+`search_files`, `search_text`, `inspect_file_metadata`, `generate_diff` and
+`get_disk_usage` work there for the rest of the session.
+
+**Write (opt-in).** When the user actually asked for a change there ("fix this
+file on drive D"), the agent calls the same tool with `write: true`. That is a
+second, separate approval, and only then do `create_file`, `edit_file`,
+`move_file` and `delete_file` work inside that root — every single one still
+prompting on its own and taking a snapshot first. Read-only grants stay
+read-only; a write attempt there is refused with instructions to ask for write
+access.
 
 - The prompt shows the canonical path that will be granted, how it is used,
-  and states that it is read-only.
+  and whether it is read-only or read + write.
 - Grants are session-scoped and in memory: restarting the console drops them.
-  `/access` lists them, `/access clear` revokes them all.
+  `/access` lists them (with each level), `/access clear` revokes them all.
 - A grant is a single folder (a drive root is allowed). Paths are resolved
   through `realpath` on every access and re-checked for containment, so a
   symlink inside a granted folder cannot escape it.
-- No write, move or delete ever crosses a grant: those tools stay bound to the
-  workspace and say so explicitly. To edit another folder, select it as the
-  workspace.
-- Every grant is audited as `access.grant` with the path and the stated reason.
+- Nothing outside the workspace and its grants is ever read or written.
+- Every grant is audited as `access.grant` with the path, the level and the
+  stated reason.
 
 ## Desktop actions
 
-`launch_app` and `open_url` are the only tools that act outside the workspace
-and outside the sandbox — they start GUI programs the user can see. Every call
-is tier 3 (approval required, no session grants) and audited as
-`desktop.launch`. What makes them safe is what they cannot do:
+`launch_app`, `open_url` and `close_app` are the tools that act on the user's
+desktop outside the sandbox — they start or stop programs the user can see.
+`launch_app`/`open_url` are tier 3 (approval required, no session grants) and
+`close_app` is tier 2 → 3, all audited as `desktop.launch` / `process.close`.
+What makes them safe is what they cannot do:
 
-- only ids from the catalog in `src/platform/desktop.ts` can be launched, so
-  there is no path, no flag and no shell interpreter to smuggle in;
+- the catalog in `src/platform/desktop.ts` is tried first (exact executables),
+  then Start Menu shortcuts, macOS bundles, Linux .desktop entries and PATH are
+  searched by name — never by a wildcard, and never through a shell;
+- `close_app` lists the exact pids and names it is about to stop in the
+  approval prompt, and refuses system-critical pids and Operator's own
+  process tree outright;
 - the process is started with a structured argv, `shell: false`, detached
   stdio — nothing is piped, echoed or re-parsed;
 - URLs must be absolute http(s) with no userinfo; `javascript:`, `file:` and

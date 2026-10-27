@@ -32,7 +32,7 @@ export interface RunChange {
 }
 
 /** How much a row matters when the same target is touched more than once. */
-const ACTION_RANK: Record<string, number> = { modified: 1, created: 2, opened: 2, ran: 2, moved: 3, deleted: 4 };
+const ACTION_RANK: Record<string, number> = { modified: 1, created: 2, opened: 2, ran: 2, moved: 3, closed: 3, deleted: 4 };
 
 const SCRIPT_LABELS: Record<string, string> = {
   run_tests: 'test suite',
@@ -108,6 +108,13 @@ export function collectRunChanges(steps: readonly AgentStep[]): RunChange[] {
           add({ kind: 'app', action: 'opened', target: app, ...(detail !== '' ? { detail: truncateToWidth(detail, 48) } : {}) });
           break;
         }
+        case 'close_app': {
+          const target = str(a['name']);
+          if (target === '') break;
+          const pid = typeof a['pid'] === 'number' ? `pid ${a['pid']}` : '';
+          add({ kind: 'app', action: 'closed', target, ...(pid !== '' ? { detail: pid } : {}) });
+          break;
+        }
         case 'open_url': {
           const url = str(a['url']);
           if (url === '') break;
@@ -117,6 +124,18 @@ export function collectRunChanges(steps: readonly AgentStep[]): RunChange[] {
             action: 'opened',
             target: truncateToWidth(url, 56),
             ...(browser !== '' && browser !== 'default' ? { detail: browser } : {}),
+          });
+          break;
+        }
+        case 'run_shell_command': {
+          const command = str(a['command']);
+          if (command === '') break;
+          const exit = /Command exit (\S+)/.exec(call.summary)?.[1];
+          add({
+            kind: 'command',
+            action: 'ran',
+            target: truncateToWidth(command.replace(/\s+/g, ' '), 56),
+            ...(exit !== undefined ? { detail: `exit ${exit}` } : {}),
           });
           break;
         }
@@ -167,6 +186,8 @@ function icon(ui: Ui, action: string): string {
       return ui.red('×');
     case 'opened':
       return ui.brandLight('↗');
+    case 'closed':
+      return ui.yellow('■');
     case 'ran':
       return ui.brand('▸');
     default:

@@ -134,6 +134,43 @@ describe('collectRunChanges', () => {
     assert.equal(changes.length, 1);
     assert.equal(changes[0]!.count, 2);
   });
+
+  it('reports a shell command the run executed', () => {
+    const changes = collectRunChanges([
+      step([
+        {
+          name: 'run_shell_command',
+          summary: 'Command exit 0 in 0.1s (cmd). Process id: p1.',
+          args: { command: 'ipconfig /all' },
+        },
+        { name: 'run_shell_command', summary: 'Action denied (run_shell_command)', ok: false, args: { command: 'format C:' } },
+      ]),
+    ]);
+    assert.deepEqual(
+      changes.map((c) => `${c.kind} ${c.action} ${c.target} ${c.detail ?? ''}`.trim()),
+      ['command ran ipconfig /all exit 0'],
+    );
+  });
+
+  it('reports an application the run closed', () => {
+    const changes = collectRunChanges([
+      step([{ name: 'close_app', summary: 'Closed Opera GX (pid 4211).', args: { name: 'Opera GX', pid: 4211 } }]),
+    ]);
+    assert.deepEqual(
+      changes.map((c) => `${c.kind} ${c.action} ${c.target} ${c.detail ?? ''}`.trim()),
+      ['app closed Opera GX pid 4211'],
+    );
+  });
+
+  it('ignores a close that was denied or failed', () => {
+    const changes = collectRunChanges([
+      step([
+        { name: 'close_app', summary: 'Action denied (close_app)', ok: false, args: { name: 'chrome' } },
+        { name: 'close_app', summary: 'Nothing matched "qqq"', ok: false, args: { name: 'qqq' } },
+      ]),
+    ]);
+    assert.deepEqual(changes, []);
+  });
 });
 
 describe('changes box', () => {

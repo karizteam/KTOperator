@@ -63,7 +63,7 @@ export const SLASH_COMMANDS: readonly SlashCommandSpec[] = [
   { name: 'provider', usage: '[list|use <id>|add]', help: 'list, switch, or add provider profiles' },
   { name: 'model', usage: '[use <id>|reload]', help: 'show or switch the model' },
   { name: 'workspace', usage: '[path]', help: 'show or re-authorize the workspace' },
-  { name: 'access', usage: '[list|clear]', help: 'folders you granted read-only access outside the workspace' },
+  { name: 'access', usage: '[list|clear]', help: 'paths you granted outside the workspace (read, or read + write)' },
   { name: 'sandbox', help: 'sandbox backends and availability' },
   { name: 'resume', usage: '[id]', help: 'continue a previous session with its context' },
   { name: 'doctor', help: 'full environment diagnostics' },
@@ -555,18 +555,21 @@ async function handleSlash(rt: Runtime, slash: SlashCommand, stack: ConsoleStack
       if (slash.args === 'clear' || slash.args === 'revoke') {
         const removed = rt.access.revoke(null);
         await rt.makeAudit(env.sessionId ?? 'console').record({ event: 'access.revoke', decision: 'revoked', detail: { count: removed } });
-        rt.ui.success(removed === 0 ? 'No access grants to revoke.' : `Revoked ${removed} read-only grant(s).`);
+        rt.ui.success(removed === 0 ? 'No access grants to revoke.' : `Revoked ${removed} grant(s).`);
         return;
       }
       const grants = rt.access.list();
       if (grants.length === 0) {
-        rt.ui.info(rt.ui.dim('  no paths granted · the agent asks for access with request_path_access'));
+        rt.ui.info(rt.ui.dim('  no paths granted · the agent asks with request_path_access'));
         return;
       }
       for (const g of grants) {
-        rt.ui.info(`  ${rt.ui.brandLight('●')} ${rt.ui.brand(g.root)}${g.reason !== '' ? `  ${rt.ui.dim(`— ${g.reason}`)}` : ''}`);
+        const level = g.writable ? rt.ui.yellow('read + write') : rt.ui.dim('read');
+        rt.ui.info(
+          `  ${rt.ui.brandLight('●')} ${rt.ui.brand(g.root)}${g.reason !== '' ? `  ${rt.ui.dim(`— ${g.reason}`)}` : ''}  ${rt.ui.brandDark('·')} ${level}`,
+        );
       }
-      rt.ui.info(rt.ui.dim('  read-only · this session · /access clear revokes all'));
+      rt.ui.info(rt.ui.dim('  this session · read + write grants still approve every single change · /access clear revokes all'));
       return;
     }
 
@@ -878,7 +881,11 @@ function printHeader(rt: Runtime, stack: ConsoleStack, sandboxId: string | null)
 function renderStatus(rt: Runtime, stack: ConsoleStack, sandboxId: string | null, sessionId: string, msgCount = 0): void {
   const wsPath = rt.config.workspace.current?.path ?? '(none)';
   const grants = rt.access.list();
-  const granted = grants.length === 0 ? 'none (ask the agent to inspect a path)' : `${grants.length} read-only · ${grants.map((g) => g.root).slice(0, 3).join(', ')}${grants.length > 3 ? ' …' : ''}`;
+  const writable = grants.filter((g) => g.writable).length;
+  const granted =
+    grants.length === 0
+      ? 'none (ask the agent to inspect a path)'
+      : `${grants.length} grant(s)${writable > 0 ? ` · ${writable} read + write` : ' · read-only'} · ${grants.map((g) => g.root).slice(0, 3).join(', ')}${grants.length > 3 ? ' …' : ''}`;
   rt.ui.box('status', [
     `provider   ${stack.profile.id} (${stack.profile.type})`,
     `model      ${stack.model}`,

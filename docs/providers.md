@@ -57,6 +57,19 @@ operator provider add --id gemini --type google --model gemini-2.5-pro --default
 The key is sent in the `x-goog-api-key` **header** — never in the URL — so
 it cannot leak through logs. Model discovery via `GET /v1beta/models`.
 
+This adapter always speaks the native Generative Language API
+(`/v1beta/models/{model}:generateContent` and `:streamGenerateContent?alt=sse`).
+Two details make it work with real tool calling:
+
+- tool declarations are filtered down to the OpenAPI 3.0 subset Gemini
+  accepts — keys such as `additionalProperties` make the API reject the whole
+  request with HTTP 400, so they are stripped from the wire copy (the original
+  schema still validates model arguments locally);
+- a model id is normalized before it reaches the URL, so `models/gemini-2.5-pro`
+  and `google/gemini-2.5-pro` both mean `gemini-2.5-pro`, and a profile whose
+  base URL points at the OpenAI-compatible shim (`…/v1beta/openai`) is pointed
+  back at the native API instead of sending OpenAI-shaped requests.
+
 ## Generic OpenAI-compatible endpoints
 
 ```bash

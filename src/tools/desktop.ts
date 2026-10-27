@@ -1,6 +1,6 @@
 import {
   DESKTOP_APP_IDS,
-  buildLaunchPlan,
+  buildAppLaunchPlan,
   buildOpenUrlPlan,
   launchDetached,
   type LaunchPlan,
@@ -9,11 +9,14 @@ import type { Tool, ToolContext, ToolResult } from './types.js';
 
 /**
  * Desktop tools — let the agent act on the user's machine the way a person
- * would: open a browser, open an application, look something up in the Store.
+ * would: open an application, open a browser page.
  *
- * Both tools are tier 3 (privileged/external): the user sees exactly what will
- * be opened and approves it. Nothing here can install software, run commands,
- * or launch anything outside the catalog in src/platform/desktop.ts.
+ * launch_app resolves any application that is actually installed on the
+ * machine: the common catalog first (exact executables), then the Windows
+ * Start Menu, the macOS Applications folders, Linux .desktop entries and PATH.
+ * Shells, script hosts and terminals are refused before resolution, so opening
+ * one is impossible rather than merely discouraged. Every launch is tier 3:
+ * the user sees the exact argv and approves it.
  */
 
 const BROWSERS = ['chrome', 'edge', 'firefox'] as const;
@@ -38,10 +41,19 @@ async function execute(plan: LaunchPlan, ctx: ToolContext): Promise<ToolResult> 
   };
 }
 
+/** Plan an app launch without ever throwing, for the approval prompt. */
+function tryPlan(app: string, options: { search?: string | undefined; url?: string | undefined }): LaunchPlan | null {
+  try {
+    return buildAppLaunchPlan(app, options);
+  } catch {
+    return null;
+  }
+}
+
 export const launchAppTool: Tool = {
   name: 'launch_app',
   description:
-    'Open a desktop application on the user\'s own machine. Supported apps: chrome, edge, firefox (browsers), notepad, explorer (file manager), calculator, paint, vscode, and store (Microsoft Store, Windows only). Pass `search` to open a web search in a browser or a Store search page; pass `url` to open one specific http(s) page in a browser. It cannot install or download software: for the Store it opens the search page and the user clicks Install.',
+    `Open an application on the user's own machine. Any installed application works — pass the name as the user says it ("opera", "Opera GX", "spotify", "notepad", "vscode") and Operator finds it in the Start Menu, the Applications folder or PATH; the well-known ones (${DESKTOP_APP_IDS.join(', ')}) are mapped directly. Pass \`search\` to run a web search in a browser, or \`url\` to open one specific http(s) page in a browser. It cannot install or download software: for the Store it opens the search page and the user clicks Install. Command shells, script hosts and terminals can never be opened.`,
   schema: {
     type: 'object',
     additionalProperties: false,
@@ -49,8 +61,9 @@ export const launchAppTool: Tool = {
     properties: {
       app: {
         type: 'string',
-        enum: DESKTOP_APP_IDS,
-        description: 'Which application to open (from the supported list).',
+        minLength: 1,
+        maxLength: 128,
+        description: 'Application to open: a catalog id (chrome, notepad, explorer, vscode, store, …) or any installed app name such as "Opera GX" or "Spotify".',
       },
       search: {
         type: 'string',
@@ -68,12 +81,7 @@ export const launchAppTool: Tool = {
     const app = String(input['app'] ?? '');
     const search = typeof input['search'] === 'string' ? input['search'] : undefined;
     const url = typeof input['url'] === 'string' ? input['url'] : undefined;
-    let plan: LaunchPlan | null;
-    try {
-      plan = buildLaunchPlan(app, { ...(search !== undefined ? { search } : {}), ...(url !== undefined ? { url } : {}) });
-    } catch {
-      plan = null; // invalid combinations still show the raw intent in the prompt
-    }
+    const plan = tryPlan(app, { ...(search !== undefined ? { search } : {}), ...(url !== undefined ? { url } : {}) });
     const targets = [url, search !== undefined ? `search: ${search}` : undefined, `app: ${app}`].filter(
       (t): t is string => typeof t === 'string' && t !== '',
     );
@@ -86,7 +94,7 @@ export const launchAppTool: Tool = {
   async run(input, ctx) {
     const search = typeof input['search'] === 'string' ? input['search'] : undefined;
     const url = typeof input['url'] === 'string' ? input['url'] : undefined;
-    const plan = buildLaunchPlan(String(input['app'] ?? ''), {
+    const plan = buildAppLaunchPlan(String(input['app'] ?? ''), {
       ...(search !== undefined ? { search } : {}),
       ...(url !== undefined ? { url } : {}),
     });
@@ -97,7 +105,7 @@ export const launchAppTool: Tool = {
 export const openUrlTool: Tool = {
   name: 'open_url',
   description:
-    'Open an http(s) URL in the user\'s desktop browser — the default browser or one of chrome, edge, firefox. Use it to show the user a page, docs, or a search result. Only http/https can be opened.',
+    "Open an http(s) URL in the user's desktop browser — the default browser or one of chrome, edge, firefox. Use it to show the user a page, docs, or a search result. Only http/https can be opened.",
   schema: {
     type: 'object',
     additionalProperties: false,

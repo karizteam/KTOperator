@@ -7,6 +7,95 @@ import { validateProviderBaseUrl } from './ssrf.js';
 
 export const GOOGLE_DEFAULT_BASE = 'https://generativelanguage.googleapis.com';
 
+/**
+ * The Generative Language API exposes two very different surfaces on the same
+ * host: the native one (`/v1beta/models/{model}:generateContent`) and an
+ * OpenAI-compatible shim (`/v1beta/openai/chat/completions`). A profile pointed
+ * at the shim would send an OpenAI request and get OpenAI-shaped errors, so the
+ * base is normalized to the host root and this adapter always speaks the
+ * native protocol.
+ */
+export function normalizeGoogleBase(raw: string | undefined): string {
+  const value = (raw ?? GOOGLE_DEFAULT_BASE).trim() || GOOGLE_DEFAULT_BASE;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return value.replace(/\/+$/, '');
+  }
+  const path = url.pathname.replace(/\/+$/, '').replace(/\/(v1beta|v1)(\/openai)?$/i, '').replace(/\/openai$/i, '');
+  return `${url.origin}${path}`;
+}
+
+/**
+ * Gemini model ids travel in the URL path, so a slash breaks the request. Model
+ * pickers and other providers hand out ids like `models/gemini-2.5-pro` or
+ * `google/gemini-2.5-pro`; both mean the same model here.
+ */
+export function normalizeGeminiModel(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed === '') {
+    throw new ProviderError('invalid_model', 'No Gemini model was selected.', {
+      hint: 'Pick one with `/model reload` in the console, or pass --model.',
+    });
+  }
+  let id = trimmed.replace(/^models\//i, '');
+  if (id.includes('/')) id = id.slice(id.lastIndexOf('/') + 1);
+  if (id === '') throw new ProviderError('invalid_model', `Not a Gemini model id: ${trimmed}`);
+  return id;
+}
+
+/**
+ * Gemini's `functionDeclarations[].parameters` accepts only the OpenAPI 3.0
+ * Schema subset and rejects unknown keys outright (HTTP 400 INVALID_ARGUMENT).
+ * Our tool schemas carry `additionalProperties: false` for local validation,
+ * so the wire copy is filtered down to the keys Gemini understands while the
+ * original schema keeps validating model arguments locally.
+ */
+const GEMINI_SCHEMA_KEYS = new Set([
+  'type',
+  'format',
+  'title',
+  'description',
+  'nullable',
+  'enum',
+  'items',
+  'properties',
+  'required',
+  'minimum',
+  'maximum',
+  'minItems',
+  'maxItems',
+  'minLength',
+  'maxLength',
+  'pattern',
+]);
+
+const MAX_SCHEMA_DEPTH = 12;
+
+export function toGeminiSchema(schema: unknown, depth = 0): Record<string, unknown> {
+  if (schema === null || typeof schema !== 'object' || Array.isArray(schema) || depth > MAX_SCHEMA_DEPTH) {
+    return { type: 'object', properties: {} };
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
+    if (!GEMINI_SCHEMA_KEYS.has(key)) continue; // additionalProperties, $schema, oneOf, … are refused by the API
+    if (key === 'properties') {
+      if (value === null || typeof value !== 'object' || Array.isArray(value)) continue;
+      const properties: Record<string, unknown> = {};
+      for (const [name, sub] of Object.entries(value as Record<string, unknown>)) properties[name] = toGeminiSchema(sub, depth + 1);
+      out[key] = properties;
+      continue;
+    }
+    if (key === 'items') {
+      out[key] = toGeminiSchema(value, depth + 1);
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
+}
+
 type GeminiPart =
   | { text: string }
   | { functionCall: { name: string; args: Record<string, unknown> } }
@@ -28,7 +117,7 @@ export class GoogleProvider implements AIProvider {
   private validatedBase: Promise<URL> | null = null;
 
   constructor(profile: ProviderProfile, apiKey: string | null, deps: ProviderDeps = {}) {
-    this.baseUrl = (profile.baseUrl ?? GOOGLE_DEFAULT_BASE).replace(/\/+$/, '');
+    this.baseUrl = normalizeGoogleBase(profile.baseUrl);
     this.apiKey = apiKey;
     this.deps = deps;
     this.trustedLocal = profile.trustedLocal;
@@ -53,11 +142,20 @@ export class GoogleProvider implements AIProvider {
     if (!this.apiKey) {
       throw new ProviderError('auth', 'Google API key is not configured.', { hint: 'Set GOOGLE_API_KEY or add the profile in the console (/provider add).' });
     }
+    const model = normalizeGeminiModel(request.model);
     const { systemInstruction, contents } = toGeminiContents(request.messages);
     const body: Record<string, unknown> = { contents };
     if (systemInstruction) body['systemInstruction'] = { parts: [{ text: systemInstruction }] };
     if (request.tools && request.tools.length > 0) {
-      body['tools'] = [{ functionDeclarations: request.tools.map((t) => ({ name: t.name, description: t.description, parameters: t.parameters })) }];
+      body['tools'] = [
+        {
+          functionDeclarations: request.tools.map((t) => ({
+            name: t.name,
+            description: t.description,
+            parameters: toGeminiSchema(t.parameters),
+          })),
+        },
+      ];
     }
     const generationConfig: Record<string, unknown> = {};
     if (request.maxTokens !== undefined) generationConfig['maxOutputTokens'] = request.maxTokens;
@@ -66,11 +164,11 @@ export class GoogleProvider implements AIProvider {
     if (Object.keys(generationConfig).length > 0) body['generationConfig'] = generationConfig;
 
     if (request.stream) {
-      const url = await this.endpoint(`/v1beta/models/${encodeURIComponent(request.model)}:streamGenerateContent?alt=sse`);
+      const url = await this.endpoint(`/v1beta/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`);
       const res = await httpRequest(url, this.reqOptions(body, request.signal));
       return this.consumeStream(res, request);
     }
-    const url = await this.endpoint(`/v1beta/models/${encodeURIComponent(request.model)}:generateContent`);
+    const url = await this.endpoint(`/v1beta/models/${encodeURIComponent(model)}:generateContent`);
     const json = (await httpJson(url, this.reqOptions(body, request.signal))) as Record<string, unknown>;
     return parseGeminiResponse(json);
   }

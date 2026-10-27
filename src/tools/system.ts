@@ -75,7 +75,7 @@ export const getDiskUsageTool: Tool = {
 
 export const getProcessSummaryTool: Tool = {
   name: 'get_process_summary',
-  description: 'Top processes by memory usage (pid, command, RSS, CPU% where available). Read-only listing; the agent cannot kill arbitrary processes.',
+  description: 'Top processes by memory usage (pid, command, RSS, CPU% where available). Read-only listing; to stop one, use close_app with its name (or pid) — that asks the user first.',
   schema: {
     type: 'object',
     additionalProperties: false,

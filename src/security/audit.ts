@@ -16,6 +16,7 @@ export type AuditEventType =
   | 'approval'
   | 'command.execute'
   | 'desktop.launch'
+  | 'process.close'
   | 'access.grant'
   | 'access.revoke'
   | 'file.backup'

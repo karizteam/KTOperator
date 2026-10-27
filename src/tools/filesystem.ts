@@ -4,18 +4,13 @@ import crypto from 'node:crypto';
 import { PathSecurityError, ToolExecutionError, WorkspaceError } from '../errors/errors.js';
 import { unifiedDiff } from '../util/diff.js';
 import type { Tool, ToolContext } from './types.js';
-import type { ResolvedEntry, ResolveOptions, WorkspaceBoundary } from '../security/path-validation.js';
+import type { ResolvedEntry, ResolveOptions } from '../security/path-validation.js';
 import { covers } from '../security/access.js';
 
 /** Hard ceilings for recursive traversal (defense against runaway walks). */
 const WALK_MAX_DEPTH = 8;
 const WALK_MAX_VISITS = 20_000;
 const IGNORED_DIRS = new Set(['.git', 'node_modules', '.hg', '.svn', '__pycache__', '.idea', '.vscode']);
-
-function ws(ctx: ToolContext): WorkspaceBoundary {
-  if (!ctx.workspace) throw new WorkspaceError('No workspace selected.');
-  return ctx.workspace;
-}
 
 function cap(ctx: ToolContext, requested: number | undefined, fallback: number): number {
   return Math.max(1, Math.min(requested ?? fallback, 10_000));
@@ -52,15 +47,50 @@ export async function resolveReadPath(ctx: ToolContext, input: string, options: 
   );
 }
 
-/** Resolve an absolute-or-relative path for a WRITE (workspace only). */
+/**
+ * Resolve an absolute-or-relative path for a WRITE: the workspace, or a folder
+ * the user explicitly granted WRITE access to with request_path_access. A
+ * read-only grant stays read-only — the error says exactly how to upgrade it.
+ */
 async function resolveWrite(ctx: ToolContext, input: string, options: ResolveOptions = {}): Promise<ResolvedEntry> {
-  const boundary = ws(ctx);
-  if (path.isAbsolute(input) && !covers(boundary.root, path.resolve(input))) {
-    throw new PathSecurityError(`Refusing to write outside the workspace: ${input}`, {
-      hint: 'Access grants are read-only by design. Add the folder as the workspace if it really must be edited.',
+  const absolute = path.isAbsolute(input);
+  if (ctx.workspace && (!absolute || covers(ctx.workspace.root, path.resolve(input)))) {
+    return ctx.workspace.resolve(input, options);
+  }
+  if (absolute) {
+    const grant = ctx.access.writableCovering(path.resolve(input));
+    if (grant) return ctx.access.resolve(input, options);
+    const readOnly = ctx.access.covering(path.resolve(input));
+    if (readOnly) {
+      throw new PathSecurityError(
+        `Refusing to write to ${input}: the grant for ${readOnly.root} is READ-ONLY. Ask the user with request_path_access path="${readOnly.root}" write=true first — never write there without that approval.`,
+        { hint: `Call request_path_access with path="${readOnly.root}" and write=true, then retry once the user approves.` },
+      );
+    }
+  }
+  if (!ctx.workspace) {
+    throw new WorkspaceError('No workspace is selected and no folder has a write grant. Call request_path_access with write=true (an absolute path) to ask the user, or ask them to select a workspace.', {
+      hint: 'Writes need either a selected workspace or a user-approved write grant.',
     });
   }
-  return boundary.resolve(input, options);
+  throw new PathSecurityError(
+    `Refusing to write outside the workspace: ${input}. Call request_path_access with that folder and write=true to ask the user for write access first.`,
+    { hint: 'Read-only grants never allow writes; only the user can grant write access.' },
+  );
+}
+
+/**
+ * Best-effort read resolution for an approval preview: the workspace first,
+ * then a folder the user granted. Used only to build a diff before the write,
+ * so a missing grant simply means "no preview", never a failed call.
+ */
+async function resolvePreview(ctx: ToolContext, input: string, options: ResolveOptions = {}): Promise<ResolvedEntry> {
+  if (ctx.workspace && (!path.isAbsolute(input) || covers(ctx.workspace.root, path.resolve(input)))) {
+    return ctx.workspace.resolve(input, options);
+  }
+  if (path.isAbsolute(input) && ctx.access.covering(path.resolve(input))) return ctx.access.resolve(input, options);
+  if (ctx.workspace) return ctx.workspace.resolve(input, options);
+  throw new PathSecurityError(`No access to ${input}.`);
 }
 
 async function readTextBounded(absPath: string, ctx: ToolContext, maxBytes?: number): Promise<{ text: string; truncated: boolean }> {
@@ -411,8 +441,10 @@ async function writeVerified(absPath: string, content: string, rel: string): Pro
 
 export const createFileTool: Tool = {
   name: 'create_file',
-  description: 'Create a new file inside the workspace with given content. Requires approval; overwriting an existing file escalates to a destructive approval.',
+  description:
+    'Create a new file with given content: inside the workspace, or in a folder the user granted write access to with request_path_access. Requires approval; overwriting an existing file escalates to a destructive approval.',
   requiresWorkspace: true,
+  workspaceOptional: true,
   schema: {
     type: 'object',
     additionalProperties: false,
@@ -435,9 +467,9 @@ export const createFileTool: Tool = {
       targets: [rel],
       preview: content.split('\n').slice(0, 30).map((l) => `+${l}`).join('\n'),
     };
-    if (!ctx.workspace) return fresh;
+    if (!ctx.workspace && ctx.access.list().length === 0) return fresh;
     try {
-      const resolved = await ctx.workspace.resolve(rel, { allowMissing: true });
+      const resolved = await resolvePreview(ctx, rel, { allowMissing: true });
       if (resolved.kind === 'file') {
         const original = await fs.readFile(resolved.realPath, 'utf8');
         const diff = unifiedDiff(original, content, { fromLabel: `a/${rel}`, toLabel: `b/${rel}` });
@@ -485,6 +517,7 @@ export const editFileTool: Tool = {
   description:
     'Edit a file with exact find/replace operations. Each "find" snippet must match the file exactly (whitespace included). Set all=true to replace every occurrence. Shows a diff preview and backs up before writing.',
   requiresWorkspace: true,
+  workspaceOptional: true,
   schema: {
     type: 'object',
     additionalProperties: false,
@@ -513,11 +546,12 @@ export const editFileTool: Tool = {
     const edits = input['edits'] as { find: string; replace: string; all?: boolean }[];
     const summary = `Apply ${edits.length} edit(s) to ${rel}`;
     const targets = [rel];
-    if (!ctx.workspace) return { summary, targets };
+    if (!ctx.workspace && ctx.access.list().length === 0) return { summary, targets };
 
     let original: string;
     try {
-      const entry = await ctx.workspace.resolveFile(rel, { maxFileBytes: ctx.config.limits.maxFileBytes });
+      const entry = await resolvePreview(ctx, rel, { maxFileBytes: ctx.config.limits.maxFileBytes });
+      if (entry.kind !== 'file') return { summary, targets };
       original = await fs.readFile(entry.realPath, 'utf8');
     } catch {
       return { summary, targets }; // unreadable/missing: approval still shows the summary
@@ -570,8 +604,10 @@ export const editFileTool: Tool = {
 
 export const moveFileTool: Tool = {
   name: 'move_file',
-  description: 'Move/rename a file within the workspace. Destination must also be inside the workspace.',
+  description:
+    'Move/rename a file inside the workspace or inside a folder the user granted write access to. Source and destination must both be in the same writable place.',
   requiresWorkspace: true,
+  workspaceOptional: true,
   schema: {
     type: 'object',
     additionalProperties: false,
@@ -619,8 +655,9 @@ export const moveFileTool: Tool = {
 export const deleteFileTool: Tool = {
   name: 'delete_file',
   description:
-    'Delete a single file after operation-specific approval. Always backed up first when backups are enabled. Directories and recursive deletion are NOT supported by design.',
+    'Delete a single file after operation-specific approval (inside the workspace or in a folder the user granted write access to). Always backed up first when backups are enabled. Directories and recursive deletion are NOT supported by design.',
   requiresWorkspace: true,
+  workspaceOptional: true,
   schema: {
     type: 'object',
     additionalProperties: false,

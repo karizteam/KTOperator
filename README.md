@@ -2,9 +2,9 @@
 
 # 🜂 ktOperator
 
-[![version](https://img.shields.io/badge/version-0.4.0-8B9A6E?style=flat-square)](https://www.npmjs.com/package/@karizteam/operator)
+[![version](https://img.shields.io/badge/version-0.5.0-8B9A6E?style=flat-square)](https://www.npmjs.com/package/@karizteam/operator)
 [![node](https://img.shields.io/badge/node-%E2%89%A522.12-339933?style=flat-square&logo=node.js&logoColor=white)](https://nodejs.org)
-[![tests](https://img.shields.io/badge/tests-263%20passing-success?style=flat-square)](#-development)
+[![tests](https://img.shields.io/badge/tests-319%20passing-success?style=flat-square)](#-development)
 [![license](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
 **The AI decides what it wants to do. The security engine decides what it is allowed to do.**
@@ -30,9 +30,10 @@ operator plan "Run the tests and summarize the failures"   # plan only, executes
 
 - **💬 A real console** — onboarding once, then a chatbox with streamed, formatted answers (headings, lists, code blocks, full Persian/RTL shaping), `↑`/`↓` prompt recall, `/resume` to continue a session, and `Ctrl+C` that stops a task without killing the console.
 - **📦 A changes box after every run** — folders, files, apps, links and commands the run touched, in one clean box.
-- **🧭 Dynamic access** — point at something outside the workspace (*“check drive C”*, *“open D:\projects\shop”*) and the agent asks for read-only access to that folder once, instead of replying *“no access”*. Writes still stay in the workspace.
-- **🖥️ Desktop & web actions** — *“open Chrome and search for…”*, *“open the Store page for Spotify”*, *“show me this page in Edge”* — plus web search and fetch, each URL validated before it is touched.
-- **🧰 32 tools** — files, search, diffs, project inspection, git status, test/typecheck/lint/build scripts, sandboxed commands, managed processes, system info, web, desktop.
+- **🧭 Dynamic access** — point at something outside the workspace (*“check drive C”*, *“open D:\projects\shop”*) and the agent asks for access to that folder or drive once, instead of replying *“no access”*. Read-only by default; say *“fix this file on drive D”* and it asks separately for write access there.
+- **🖥️ Desktop & web actions** — *“open Chrome and search for…”*, *“open Opera GX”* (any installed app, not just a fixed list), *“close Notepad”*, *“open the Store page for Spotify”*, *“show me this page in Edge”* — plus web search and fetch, each URL validated before it is touched.
+- **⌨️ Natural language → a real command** — ask *“show my IP in cmd”* or *“how much free space is left”* and the agent writes the actual `cmd`/`bash`/PowerShell command, shows it to you with the shell, directory and any warning, and runs it only after you approve that exact text.
+- **🧰 34 tools** — files, search, diffs, project inspection, git status, test/typecheck/lint/build scripts, sandboxed commands, managed processes, system info, web, desktop.
 - **🔐 Security by default** — 4-tier approvals, sandboxed execution, prompt-injection defense, secret redaction, full audit trail, backups and rollback.
 
 ## 🚀 Install
@@ -80,10 +81,10 @@ Later runs jump straight to the chatbox. Slash commands:
 | 🔎 **Project** | `inspect_project` `detect_project_type` `inspect_package_json` `inspect_git_status` |
 | 🧪 **Quality** | `run_tests` `run_typecheck` `run_linter` `run_build` (existing npm scripts only) |
 | ⚙️ **System** | `get_operating_system` `get_runtime_versions` `get_cpu_summary` `get_memory_summary` `get_disk_usage` `get_process_summary` |
-| 🖥️ **Processes** | `execute_approved_command` `inspect_command_result` `terminate_managed_process` |
+| 🖥️ **Processes** | `execute_approved_command` (sandboxed argv) `run_shell_command` (real cmd/bash on your machine, always approved) `inspect_command_result` `terminate_managed_process` `close_app` |
 | 🌐 **Web** | `web_search` `web_fetch` — every URL and redirect validated, output capped |
-| 🗝️ **Access** | `request_path_access` — read-only grant for a folder outside the workspace |
-| 🖼️ **Desktop** | `launch_app` (chrome · edge · firefox · notepad · explorer · calculator · paint · vscode · store) `open_url` |
+| 🗝️ **Access** | `request_path_access` — a folder or drive outside the workspace: read-only, or read + write when the user approves it |
+| 🖼️ **Desktop** | `launch_app` (chrome · edge · firefox · notepad · explorer · calculator · paint · vscode · store · **any installed app by name**) `open_url` |
 
 Every tool is classified in the [4-tier permission matrix](docs/permissions.md).
 
@@ -141,7 +142,7 @@ Full details: [architecture](docs/architecture.md) · [security](docs/security.m
 ```bash
 npm run typecheck   # strict TypeScript
 npm run lint        # eslint
-npm test            # 263 tests: unit + security + integration (no network, no API keys)
+npm test            # 319 tests: unit + security + integration (no network, no API keys)
 npm run build       # emit dist/
 npm run audit       # dependency check
 ```

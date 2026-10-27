@@ -1,6 +1,13 @@
 import { ToolExecutionError } from '../errors/errors.js';
 import { isShellExecutable } from '../core/execution/managed-process.js';
-import type { Tool, ToolResult } from './types.js';
+import {
+  isProtectedPid,
+  listHostProcesses,
+  matchHostProcesses,
+  terminateHostProcess,
+  type HostProcess,
+} from '../platform/processes.js';
+import type { Tool, ToolContext, ToolDescription, ToolResult } from './types.js';
 
 export const executeApprovedCommandTool: Tool = {
   name: 'execute_approved_command',
@@ -121,4 +128,142 @@ export const terminateManagedProcessTool: Tool = {
   },
 };
 
-export const processTools: Tool[] = [executeApprovedCommandTool, inspectCommandResultTool, terminateManagedProcessTool];
+/**
+ * close_app — close a program the user is done with, or a stuck one.
+ *
+ * The process listing is read-only and always shown to the user in the
+ * approval prompt, so "close notepad" cannot quietly kill something else with
+ * a similar name. System-critical pids and Operator's own process tree are
+ * refused outright, and matching is name-based, never a shell or wildcard.
+ */
+
+const MAX_NAME_LENGTH = 128;
+
+interface CloseTargets {
+  processes: HostProcess[];
+  /** True when a specific pid narrowed the selection. */
+  pinned: boolean;
+}
+
+async function resolveCloseTargets(input: Record<string, unknown>): Promise<CloseTargets> {
+  const name = String(input['name'] ?? '').trim();
+  const pinnedPid = typeof input['pid'] === 'number' ? input['pid'] : undefined;
+  const all = await listHostProcesses();
+  let matches = matchHostProcesses(all, name);
+  if (pinnedPid !== undefined) {
+    const narrowed = matches.filter((p) => p.pid === pinnedPid);
+    if (narrowed.length > 0) return { processes: narrowed, pinned: true };
+    const known = all.find((p) => p.pid === pinnedPid);
+    return { processes: [known ?? { pid: pinnedPid, name, command: name }], pinned: true };
+  }
+  // Never propose a pid the agent may not touch, even if it matched.
+  matches = matches.filter((p) => !isProtectedPid(p.pid));
+  return { processes: matches, pinned: false };
+}
+
+function closeSummary(targets: CloseTargets): ToolDescription {
+  const { processes, pinned } = targets;
+  if (processes.length === 0) {
+    return {
+      summary: 'Close an application — nothing matched',
+      targets: [],
+      preview: 'No running process matched that name, so nothing would be closed.',
+    };
+  }
+  const listed = processes.slice(0, 8).map((p) => `${p.pid}  ${p.name}${p.command !== p.name ? `  (${p.command})` : ''}`);
+  return {
+    summary: `Close ${processes.length} process(es): ${processes.map((p) => p.name).slice(0, 4).join(', ')}`,
+    targets: processes.slice(0, 8).map((p) => `${p.name} (pid ${p.pid})`),
+    preview: [pinned ? 'Targeted process:' : 'These processes will be asked to close:', ...listed.map((l) => `  ${l}`)].join('\n'),
+  };
+}
+
+export const closeAppTool: Tool = {
+  name: 'close_app',
+  description:
+    'Close a running application or process on the user\'s machine after they approve it. Use it when the user asks to close an app, quit a program, or kill a stuck/unresponsive one ("close chrome", "kill notepad"). Pass `name` (the program name, e.g. "opera", "chrome", "notepad"); pass `pid` when the user named a specific instance. A graceful close is requested first — if the app ignores it, call again with force=true. System-critical processes and Operator itself can never be closed. For a command that is still running inside the sandbox, use terminate_managed_process with its id instead.',
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['name'],
+    properties: {
+      name: {
+        type: 'string',
+        description: 'Application or process name, e.g. "opera", "chrome", "notepad". Matched case-insensitively.',
+        minLength: 2,
+        maxLength: MAX_NAME_LENGTH,
+      },
+      pid: { type: 'integer', description: 'Exact process id to close, when a single instance is meant.', minimum: 5 },
+      force: { type: 'boolean', description: 'Force-kill when a graceful close did not stop it.' },
+    },
+  },
+  escalateTier(input) {
+    // Forcing a kill is a stronger action than asking an app to close.
+    return input['force'] === true ? 3 : null;
+  },
+  async describe(input): Promise<ToolDescription> {
+    const targets = await resolveCloseTargets(input);
+    return closeSummary(targets);
+  },
+  async run(input, ctx: ToolContext): Promise<ToolResult> {
+    const name = String(input['name'] ?? '').trim();
+    const force = input['force'] === true;
+    const targets = await resolveCloseTargets(input);
+    const { processes } = targets;
+    if (processes.length === 0) {
+      return {
+        ok: false,
+        summary: `Nothing matched "${name}"`,
+        error: `No running process matches "${name}". Check the exact name with get_process_summary, or ask the user to confirm the application name.`,
+      };
+    }
+    const blocked = processes.filter((p) => isProtectedPid(p.pid));
+    if (blocked.length === processes.length) {
+      return {
+        ok: false,
+        summary: `Refusing to close ${name}`,
+        error: `Refusing to close ${name}: every match (${blocked.map((p) => `pid ${p.pid}`).join(', ')}) is a system-critical or Operator process and cannot be terminated.`,
+      };
+    }
+
+    const closed: string[] = [];
+    const failed: string[] = [];
+    for (const process of processes) {
+      if (isProtectedPid(process.pid)) {
+        failed.push(`${process.name} (pid ${process.pid}) — protected`);
+        continue;
+      }
+      const outcome = await terminateHostProcess(process.pid, { force });
+      if (outcome.ok) closed.push(`${process.name} (pid ${process.pid})`);
+      else failed.push(`${process.name} (pid ${process.pid}) — ${outcome.detail}`);
+    }
+
+    await ctx.audit.record({
+      event: 'process.close',
+      tool: 'close_app',
+      tier: force ? 3 : 2,
+      decision: closed.length > 0 ? 'ok' : 'error',
+      detail: { name, force, closed, failed },
+    });
+
+    if (closed.length === 0) {
+      return {
+        ok: false,
+        summary: `Could not close ${name}`,
+        error: `${failed.join('; ')}. ${force ? 'Explain this to the user instead of retrying.' : 'Retrying with force=true is the next step if the user agrees.'}`,
+      };
+    }
+    return {
+      ok: true,
+      summary: `Closed ${closed.join(', ')}${failed.length > 0 ? `; failed: ${failed.join(', ')}` : ''}.`,
+      data: { closed, failed: failed.length > 0 ? failed : undefined, forced: force },
+    };
+  },
+};
+
+export const processTools: Tool[] = [
+  executeApprovedCommandTool,
+  inspectCommandResultTool,
+  terminateManagedProcessTool,
+  closeAppTool,
+];

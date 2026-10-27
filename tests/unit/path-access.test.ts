@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { PathAccess, canonicalGrantRoot, covers } from '../../src/security/access.js';
+import { PathAccess, canonicalGrantRoot, covers, normalizeGrantInput } from '../../src/security/access.js';
 import { TOOL_BASE_TIER } from '../../src/security/policy.js';
 import { ALL_TOOLS } from '../../src/tools/index.js';
 import { makeHarness } from '../helpers.js';
@@ -81,6 +81,115 @@ describe('path grants', () => {
       await assert.rejects(access.resolve('relative/path'), /absolute/);
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('write grants', () => {
+  it('turns a bare drive letter into that drive root', () => {
+    assert.equal(normalizeGrantInput('d'), 'D:\\');
+    assert.equal(normalizeGrantInput('c:'), 'C:\\');
+    assert.equal(normalizeGrantInput('C:/'), 'C:\\');
+    assert.equal(normalizeGrantInput('D:\\'), 'D:\\');
+    assert.equal(normalizeGrantInput('/etc'), '/etc');
+    assert.equal(normalizeGrantInput('  "D:/"  '), 'D:\\');
+  });
+
+  it('upgrades an existing grant instead of duplicating it, and never downgrades', () => {
+    const access = new PathAccess();
+    const readOnly = access.add(path.resolve(os.tmpdir(), 'op-up'), 'look');
+    assert.equal(readOnly.writable, false);
+    assert.equal(access.writableCovering(path.join(readOnly.root, 'a.txt')), null);
+
+    const upgraded = access.add(readOnly.root, 'fix', { writable: true });
+    assert.equal(upgraded.writable, true);
+    assert.equal(access.list().length, 1, 'the same root is one grant');
+    assert.equal(access.writableCovering(path.join(readOnly.root, 'a.txt'))?.root, readOnly.root);
+
+    assert.equal(access.add(readOnly.root).writable, true, 'a later read-only request must not downgrade the grant');
+  });
+
+  it('writes outside the workspace only where the user approved write access', async () => {
+    const h = await makeHarness();
+    const readOnlyDir = await tempDir('op-ro-');
+    const writableDir = await tempDir('op-rw-');
+    try {
+      // 1. A read-only grant still refuses writes, and says how to get access.
+      const readGrant = await h.registry.execute('request_path_access', JSON.stringify({ path: readOnlyDir }), h.toolContext);
+      assert.equal(readGrant.ok, true, readGrant.error);
+      const refused = await h.registry.execute(
+        'create_file',
+        JSON.stringify({ path: path.join(readOnlyDir, 'n.txt'), content: 'x' }),
+        h.toolContext,
+      );
+      assert.equal(refused.ok, false);
+      assert.match(String(refused.error), /READ-ONLY/);
+      assert.match(String(refused.error), /write=true/);
+      await assert.rejects(fs.access(path.join(readOnlyDir, 'n.txt')), 'nothing may be written under a read-only grant');
+
+      // 2. A write grant enables create/edit/delete there.
+      const writeGrant = await h.registry.execute(
+        'request_path_access',
+        JSON.stringify({ path: writableDir, write: true, reason: 'user asked to fix these files' }),
+        h.toolContext,
+      );
+      assert.equal(writeGrant.ok, true, writeGrant.error);
+      assert.equal(h.access.covering(writableDir)?.writable, true);
+
+      const target = path.join(writableDir, 'notes.md');
+      const created = await h.registry.execute('create_file', JSON.stringify({ path: target, content: 'hello\n' }), h.toolContext);
+      assert.equal(created.ok, true, created.error);
+      assert.equal(await fs.readFile(target, 'utf8'), 'hello\n');
+
+      const edited = await h.registry.execute(
+        'edit_file',
+        JSON.stringify({ path: target, edits: [{ find: 'hello', replace: 'bye' }] }),
+        h.toolContext,
+      );
+      assert.equal(edited.ok, true, edited.error);
+      assert.equal(await fs.readFile(target, 'utf8'), 'bye\n');
+
+      // The approval preview reads the folder through the grant, not the workspace.
+      const preview = await h.registry.get('create_file')!.describe!({ path: target, content: 'bye\n' }, h.toolContext);
+      assert.match(String(preview.preview), /no change|identical/i);
+
+      const deleted = await h.registry.execute('delete_file', JSON.stringify({ path: target }), h.toolContext);
+      assert.equal(deleted.ok, true, deleted.error);
+      await assert.rejects(fs.access(target));
+
+      // 3. The workspace keeps working, and a path with no grant is still refused.
+      const inside = await h.registry.execute('create_file', JSON.stringify({ path: 'inside.txt', content: 'x' }), h.toolContext);
+      assert.equal(inside.ok, true, inside.error);
+      const stranger = await h.registry.execute(
+        'create_file',
+        JSON.stringify({ path: path.join(h.tmp, 'stranger.txt'), content: 'x' }),
+        h.toolContext,
+      );
+      assert.equal(stranger.ok, false);
+      assert.match(String(stranger.error), /outside the workspace/);
+    } finally {
+      await h.cleanup();
+      await fs.rm(readOnlyDir, { recursive: true, force: true });
+      await fs.rm(writableDir, { recursive: true, force: true });
+    }
+  });
+
+  it('never grants write access without approval', async () => {
+    const h = await makeHarness({ approvalMode: { kind: 'deny-all' } });
+    const outside = await tempDir('op-rw-');
+    try {
+      const result = await h.registry.execute(
+        'request_path_access',
+        JSON.stringify({ path: outside, write: true }),
+        h.toolContext,
+      );
+      assert.equal(result.ok, false);
+      assert.match(result.summary, /denied/i);
+      assert.equal(h.access.list().length, 0);
+      assert.equal(await h.registry.execute('create_file', JSON.stringify({ path: path.join(outside, 'x.txt'), content: 'x' }), h.toolContext).then((r) => r.ok), false);
+    } finally {
+      await h.cleanup();
+      await fs.rm(outside, { recursive: true, force: true });
     }
   });
 });

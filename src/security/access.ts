@@ -4,17 +4,21 @@ import { PathSecurityError } from '../errors/errors.js';
 import type { EntryKind, ResolvedEntry, ResolveOptions } from './path-validation.js';
 
 /**
- * Session-scoped, read-only access grants for paths outside the workspace.
+ * Session-scoped access grants for paths outside the workspace.
  *
- * The workspace stays the only place the agent may WRITE. This module is what
- * makes Operator dynamic instead of rigid: when the user says "check drive C"
- * or "look at D:\projects\shop", the agent asks for a specific grant, the user
- * approves it once, and every read tool keeps working — in the workspace and
- * in the granted folder — for the rest of the session.
+ * The workspace is always writable. This module is what makes Operator
+ * dynamic instead of rigid: when the user says "check drive C", "look at
+ * D:\projects\shop" or "fix the config in C:\apps\myapp", the agent asks for a
+ * specific grant, the user approves it once, and the tools keep working — in
+ * the workspace and in the granted folder — for the rest of the session.
+ *
+ * Two grant levels, both an explicit user decision (tier 3 approval):
+ *   - READ  (default): list/read/search/diff work there; writes stay refused;
+ *   - WRITE (opt-in) : the same tools plus create/edit/move/delete, each one
+ *     still approved and backed up like a workspace change.
  *
  * Guarantees that do not change:
- *   - a grant is always an explicit user decision (tier 3 approval);
- *   - a grant is read-only: no create/edit/delete/move can cross it;
+ *   - a grant is never implicit: it needs the user's approval in the prompt;
  *   - every path is still canonicalized through realpath and re-checked for
  *     containment, so a symlink inside a granted folder cannot escape it;
  *   - grants live in memory for one session; nothing is persisted.
@@ -27,6 +31,8 @@ export interface PathGrant {
   label: string;
   /** Why the user granted it, when the model explained. */
   reason: string;
+  /** True when the user also approved writes inside this root. */
+  writable: boolean;
   grantedAt: string;
 }
 
@@ -38,6 +44,18 @@ export function covers(root: string, candidate: string): boolean {
 }
 
 /**
+ * A bare drive letter means its root: "C", "C:", "C:/", "d:\\" all become
+ * "C:\\". Without this, `path.resolve("D:")` resolves against the current
+ * directory *on drive D*, which is why "switch to drive D" used to fail.
+ */
+export function normalizeGrantInput(raw: string): string {
+  const trimmed = raw.trim().replace(/^"/, '').replace(/"$/, '');
+  const drive = /^([a-zA-Z]):?[\\/]?$/.exec(trimmed);
+  if (drive) return `${drive[1]!.toUpperCase()}:\\`;
+  return trimmed;
+}
+
+/**
  * Canonicalize a path the user approved. Unlike a workspace, a drive root or a
  * folder such as /etc is legitimate here — the user said "look there".
  */
@@ -45,7 +63,7 @@ export async function canonicalGrantRoot(input: string): Promise<string> {
   if (typeof input !== 'string' || input.trim() === '' || input.includes('\u0000')) {
     throw new PathSecurityError('Invalid path: it is empty or contains NUL.');
   }
-  const trimmed = input.trim();
+  const trimmed = normalizeGrantInput(input);
   if (trimmed.length > 4096) throw new PathSecurityError('Path is unreasonably long.');
   const abs = path.resolve(trimmed);
   let real: string;
@@ -81,14 +99,25 @@ export class PathAccess {
     return this.grants.some((g) => path.resolve(g.root) === path.resolve(root));
   }
 
-  /** Register a grant (idempotent per root). */
-  add(root: string, reason = ''): PathGrant {
+  /**
+   * Register a grant, or upgrade an existing one to writable. A later
+   * `writable: true` wins: the user approved writes the second time.
+   */
+  add(root: string, reason = '', options: { writable?: boolean } = {}): PathGrant {
+    const writable = options.writable ?? false;
     const existing = this.grants.find((g) => g.root === root);
-    if (existing) return existing;
+    if (existing) {
+      if (writable && !existing.writable) {
+        existing.writable = true;
+        if (reason !== '') existing.reason = reason.slice(0, 200);
+      }
+      return existing;
+    }
     const grant: PathGrant = {
       root,
       label: root,
       reason: reason.slice(0, 200),
+      writable,
       grantedAt: new Date().toISOString(),
     };
     this.grants.push(grant);
@@ -120,6 +149,12 @@ export class PathAccess {
       if (best === null || grant.root.length > best.root.length) best = grant;
     }
     return best;
+  }
+
+  /** The most specific WRITABLE grant containing `candidate`, or null. */
+  writableCovering(candidate: string): PathGrant | null {
+    const grant = this.covering(candidate);
+    return grant !== null && grant.writable ? grant : null;
   }
 
   /**
