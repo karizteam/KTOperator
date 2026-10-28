@@ -68,7 +68,15 @@ Two details make it work with real tool calling:
 - a model id is normalized before it reaches the URL, so `models/gemini-2.5-pro`
   and `google/gemini-2.5-pro` both mean `gemini-2.5-pro`, and a profile whose
   base URL points at the OpenAI-compatible shim (`…/v1beta/openai`) is pointed
-  back at the native API instead of sending OpenAI-shaped requests.
+  back at the native API instead of sending OpenAI-shaped requests;
+- every `functionCall` arrives signed with an opaque `thoughtSignature`, which
+  Gemini 3 requires back verbatim on the next turn (HTTP 400 "Function call is
+  missing a thought_signature in functionCall parts" otherwise). The signature
+  travels on the tool call, is replayed unchanged, and a call with no signature
+  of its own — rebuilt from an older session or another provider — gets Google's
+  documented `skip_thought_signature_validator` placeholder;
+- parallel tool results go back in a single `user` turn, and thinking parts
+  (`thought: true`) are never mixed into the answer shown to you.
 
 ## Generic OpenAI-compatible endpoints
 
@@ -102,5 +110,30 @@ workspace, or included in telemetry (there is none).
 ## Model/per-session selection
 
 `--provider`/`--model` flags override the session; `defaultProvider` /
-`defaultModel` are the config fallback. **No silent provider fallback** — a
-failing request surfaces its normalized error; switching is your decision.
+`defaultModel` are the config defaults.
+
+## Fallback chain (opt-in, announced)
+
+```bash
+operator config set fallback.enabled true
+operator config set fallback.order openrouter,openai   # optional; empty = every other profile
+```
+
+When enabled, a request that fails in a way another provider can plausibly fix
+continues on the next profile in the chain, with the run's context intact:
+
+| Falls back | Does not fall back |
+|---|---|
+| `rate_limit`, `insufficient_credits`, `network`, `timeout`, `provider`, any HTTP 5xx | `auth`, `invalid_request`, `invalid_model`, `unsupported`, `aborted`, any other 4xx |
+
+Rules the implementation keeps:
+
+- **Never after streaming.** If any answer text already reached the screen, the
+  error is surfaced instead of printing a second answer over it.
+- **Never silent.** Every switch prints `Provider fallback: <from> → <to> —
+  <reason>` (suppressed only in `--json`, where the run's report carries the
+  result).
+- **Same capabilities as the primary.** A fallback entry that cannot do what the
+  session was set up for is not used as a downgrade.
+- **Default off.** Answering with a different model than the one selected is
+  not something to opt someone into.

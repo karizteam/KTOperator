@@ -12,8 +12,10 @@ import { WorkspaceBoundary } from '../security/path-validation.js';
 import { PathAccess } from '../security/access.js';
 import { ConfigError, WorkspaceError } from '../errors/errors.js';
 import { createProvider, findProfile, resolveModel } from '../providers/registry.js';
+import { FallbackProvider, type FallbackEntry, type FallbackEvent } from '../providers/fallback.js';
 import type { AIProvider } from '../providers/interfaces/types.js';
 import type { ProviderProfile } from '../config/schema.js';
+import type { InstructionFile } from '../core/agent/instructions.js';
 
 export interface CliGlobals {
   json: boolean;
@@ -30,12 +32,25 @@ export class Runtime {
   private controller = new AbortController();
   config!: OperatorConfig;
   backups!: BackupManager;
+  /**
+   * Project instruction files the user approved for this session (AGENTS.md).
+   * Session state, not config: it is re-derived from the workspace each time.
+   */
+  projectInstructions: InstructionFile[] = [];
   private boundary: WorkspaceBoundary | null | undefined; // undefined = not tried
   /** Long-lived command that wants to own Ctrl+C (the interactive console). */
   private interruptListener: (() => void) | null = null;
+  /** Told whenever the fallback chain moves to another profile. */
+  providerSwitchListener: ((event: FallbackEvent) => void) | null = null;
 
   private constructor(globals: CliGlobals) {
     this.ui = new Ui({ json: globals.json, noColor: globals.noColor });
+    // A model switch is never silent: the user must know who answered.
+    if (!globals.json) {
+      this.providerSwitchListener = (event) => {
+        this.ui.warn(`Provider fallback: ${event.from} → ${event.to} — ${event.reason}`);
+      };
+    }
   }
 
   static async create(globals: CliGlobals): Promise<Runtime> {
@@ -143,6 +158,39 @@ export class Runtime {
     const profile = findProfile(this.config, options.provider);
     const model = resolveModel(profile, this.config, options.model);
     return { profile, provider: null as unknown as AIProvider, model };
+  }
+
+  /**
+   * The active provider, wrapped in the configured fallback chain when it is
+   * enabled. Falls back only on transient failures (see providers/fallback.ts),
+   * and announces every switch.
+   */
+  async buildProviderWithFallback(profile: ProviderProfile, model: string): Promise<AIProvider> {
+    const primary = await this.buildProvider(profile);
+    const settings = this.config.fallback;
+    if (!settings.enabled) return primary;
+
+    const ids = (settings.order.length > 0 ? settings.order : this.config.providers.map((p) => p.id)).filter((id) => id !== profile.id);
+    const entries: FallbackEntry[] = [{ label: `${profile.id} · ${model}`, model, provider: primary }];
+    for (const id of ids.slice(0, 4)) {
+      const candidate = this.config.providers.find((p) => p.id === id);
+      if (!candidate) continue;
+      const candidateModel = candidate.model ?? this.config.defaultModel;
+      if (!candidateModel) continue;
+      try {
+        const key = await this.credentials.resolve(candidate);
+        if (!key.value && candidate.type !== 'ollama') continue;
+        entries.push({
+          label: `${candidate.id} · ${candidateModel}`,
+          model: candidateModel,
+          provider: createProvider(candidate, key.value, this.config, { maxRetries: this.config.limits.maxProviderRetries }),
+        });
+      } catch {
+        continue; // an unusable profile must not break the primary
+      }
+    }
+    if (entries.length === 1) return primary;
+    return new FallbackProvider(entries, this.providerSwitchListener ?? undefined);
   }
 
   async buildProvider(profile: ProviderProfile): Promise<AIProvider> {

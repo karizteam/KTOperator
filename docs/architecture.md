@@ -79,11 +79,11 @@ A single `AIProvider` interface (chat, streaming, tool calling, capability detec
 - **OpenRouter** — first-class: attribution headers, `/models` capability detection via `supported_parameters`, cost reporting via `usage: { include: true }`, `/auth/key` connectivity test.
 - **OpenAI / generic OpenAI-compatible / Ollama** — shared chat-completions adapter with per-provider base URL and policy differences. Ollama is treated as an explicitly trusted local endpoint.
 - **Anthropic** — Messages API with system-message extraction, `tool_use`/`tool_result` block mapping, SSE streaming.
-- **Google Gemini** — `generateContent`/`streamGenerateContent` with `functionDeclarations`; the API key travels in the `x-goog-api-key` **header**, never the URL.
+- **Google Gemini** — `generateContent`/`streamGenerateContent` with `functionDeclarations`; the API key travels in the `x-goog-api-key` **header**, never the URL, and each `functionCall` part carries its `thoughtSignature` back on the following turn (Gemini rejects tool calls without it).
 
 Normalized error taxonomy: `auth`, `rate_limit` (respects `Retry-After`), `insufficient_credits`, `invalid_model`, `invalid_request`, `network`, `timeout`, `provider`, `unsupported`, `aborted`. Retries (bounded, jittered) only on 429/5xx/network — never on auth or 4xx.
 
-There is **no silent provider fallback**: a failing request errors out with a clear message; switching providers is always an explicit user action.
+There is **no silent provider fallback**: the default is to surface the normalized error, and switching providers is the user's decision. Opting in to `fallback.enabled` wraps the active profile in a chain (`FallbackProvider`) that retries transient failures — rate limit, exhausted credits, network, timeout, 5xx — on the next configured profile and announces the switch; auth and 4xx errors never move, and nothing falls back once text was streamed to the screen.
 
 ## Testability boundaries
 

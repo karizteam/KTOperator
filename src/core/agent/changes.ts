@@ -32,7 +32,7 @@ export interface RunChange {
 }
 
 /** How much a row matters when the same target is touched more than once. */
-const ACTION_RANK: Record<string, number> = { modified: 1, created: 2, opened: 2, ran: 2, moved: 3, closed: 3, deleted: 4 };
+const ACTION_RANK: Record<string, number> = { modified: 1, created: 2, opened: 2, ran: 2, started: 2, moved: 3, closed: 3, deleted: 4 };
 
 const SCRIPT_LABELS: Record<string, string> = {
   run_tests: 'test suite',
@@ -139,6 +139,14 @@ export function collectRunChanges(steps: readonly AgentStep[]): RunChange[] {
           });
           break;
         }
+        case 'start_background_process': {
+          const command = str(a['command']);
+          if (command === '') break;
+          const label = str(a['label']);
+          const target = (label !== '' ? label : command).replace(/\s+/g, ' ');
+          add({ kind: 'command', action: 'started', target: truncateToWidth(target, 56), detail: 'background' });
+          break;
+        }
         case 'execute_approved_command': {
           const argv = Array.isArray(a['argv']) ? (a['argv'] as unknown[]).map(String).join(' ') : '';
           if (argv === '') break;
@@ -190,6 +198,8 @@ function icon(ui: Ui, action: string): string {
       return ui.yellow('■');
     case 'ran':
       return ui.brand('▸');
+    case 'started':
+      return ui.brand('▶');
     default:
       return ui.brandDark('·');
   }

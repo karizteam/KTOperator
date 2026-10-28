@@ -96,10 +96,48 @@ export function toGeminiSchema(schema: unknown, depth = 0): Record<string, unkno
   return out;
 }
 
+/**
+ * Gemini 3 signs every function call with an opaque `thoughtSignature` and
+ * rejects the next turn — HTTP 400 "Function call is missing a
+ * thought_signature in functionCall parts" — unless each part travels back
+ * exactly as it arrived. Google documents one placeholder for parts the API
+ * did not generate (a call rebuilt from another provider's history, or one
+ * loaded from an older session): the first function-call part of such a turn
+ * can carry this sentinel instead.
+ */
+const SKIP_THOUGHT_SIGNATURE = 'skip_thought_signature_validator';
+
 type GeminiPart =
-  | { text: string }
-  | { functionCall: { name: string; args: Record<string, unknown> } }
+  | { text: string; thought?: boolean; thoughtSignature?: string }
+  | { functionCall: { name: string; args: Record<string, unknown> }; thoughtSignature?: string }
   | { functionResponse: { name: string; response: { result: string } } };
+
+/**
+ * Tool calls from one candidate's parts, keeping the signature of each call.
+ * Thinking text (`thought: true`) is deliberately not included: it is the
+ * model's internal reasoning, not an answer for the user.
+ */
+function toolCallsFromParts(parts: GeminiPart[] | undefined): ToolCall[] {
+  const calls: ToolCall[] = [];
+  for (const part of parts ?? []) {
+    if (!('functionCall' in part)) continue;
+    calls.push({
+      id: `gemini_${calls.length}`,
+      name: part.functionCall.name,
+      arguments: JSON.stringify(part.functionCall.args ?? {}),
+      ...(part.thoughtSignature ? { signature: part.thoughtSignature } : {}),
+    });
+  }
+  return calls;
+}
+
+/** Visible text of a candidate, skipping internal thinking parts. */
+function visibleText(parts: GeminiPart[] | undefined): string {
+  return (parts ?? [])
+    .filter((part): part is { text: string; thought?: boolean } => 'text' in part && part.thought !== true && part.text !== '')
+    .map((part) => part.text)
+    .join('');
+}
 
 interface GeminiContent {
   role: 'user' | 'model';
@@ -197,13 +235,13 @@ export class GoogleProvider implements AIProvider {
       }
       const candidate = (chunk['candidates'] as { content?: { parts?: GeminiPart[] } }[] | undefined)?.[0];
       for (const part of candidate?.content?.parts ?? []) {
-        if ('text' in part && part.text) {
+        if ('text' in part) {
+          if (part.thought === true || part.text === '') continue; // reasoning, not output
           textParts.push(part.text);
           request.onToken?.(part.text);
-        } else if ('functionCall' in part) {
-          toolCalls.push({ id: `gemini_${toolCalls.length}`, name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args ?? {}) });
         }
       }
+      toolCalls.push(...toolCallsFromParts(candidate?.content?.parts));
       const meta = chunk['usageMetadata'] as { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number } | undefined;
       if (meta) {
         usage = {
@@ -244,37 +282,48 @@ export class GoogleProvider implements AIProvider {
   }
 }
 
-function toGeminiContents(messages: ChatMessage[]): { systemInstruction: string | undefined; contents: GeminiContent[] } {
+export function toGeminiContents(messages: ChatMessage[]): { systemInstruction: string | undefined; contents: GeminiContent[] } {
   const systemParts: string[] = [];
   const contents: GeminiContent[] = [];
+  /** Gemini expects alternating turns: merge neighbours instead of repeating a role. */
+  const append = (role: GeminiContent['role'], parts: GeminiPart[]): void => {
+    const last = contents[contents.length - 1];
+    if (last !== undefined && last.role === role) {
+      last.parts.push(...parts);
+      return;
+    }
+    contents.push({ role, parts });
+  };
   for (const m of messages) {
     if (m.role === 'system') {
       systemParts.push(m.content);
       continue;
     }
     if (m.role === 'tool') {
-      contents.push({
-        role: 'user',
-        parts: [{ functionResponse: { name: m.name ?? 'tool', response: { result: m.content } } }],
-      });
+      // Parallel tool calls all answer into ONE user turn, in call order.
+      append('user', [{ functionResponse: { name: m.name ?? 'tool', response: { result: m.content } } }]);
       continue;
     }
     if (m.role === 'assistant') {
       const parts: GeminiPart[] = [];
       if (m.content) parts.push({ text: m.content });
-      for (const tc of m.toolCalls ?? []) {
+      (m.toolCalls ?? []).forEach((tc, index) => {
         let args: Record<string, unknown> = {};
         try {
           args = JSON.parse(tc.arguments) as Record<string, unknown>;
         } catch {
           /* empty */
         }
-        parts.push({ functionCall: { name: tc.name, args } });
-      }
-      contents.push({ role: 'model', parts: parts.length > 0 ? parts : [{ text: '' }] });
+        // The signature Gemini returned must be replayed verbatim; an unsigned
+        // call (rebuilt from history, or from another provider) gets the
+        // documented sentinel on the first part of the turn.
+        const signature = tc.signature ?? (index === 0 ? SKIP_THOUGHT_SIGNATURE : undefined);
+        parts.push({ functionCall: { name: tc.name, args }, ...(signature !== undefined ? { thoughtSignature: signature } : {}) });
+      });
+      append('model', parts.length > 0 ? parts : [{ text: '' }]);
       continue;
     }
-    contents.push({ role: 'user', parts: [{ text: m.content }] });
+    append('user', [{ text: m.content }]);
   }
   return { systemInstruction: systemParts.length > 0 ? systemParts.join('\n\n') : undefined, contents };
 }
@@ -288,15 +337,11 @@ function parseGeminiResponse(json: Record<string, unknown>): ChatResult {
     }
     throw new ProviderError('provider', 'Gemini returned no candidates.');
   }
-  const textParts: string[] = [];
-  const toolCalls: ToolCall[] = [];
-  for (const part of candidate.content?.parts ?? []) {
-    if ('text' in part && part.text) textParts.push(part.text);
-    else if ('functionCall' in part) toolCalls.push({ id: `gemini_${toolCalls.length}`, name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args ?? {}) });
-  }
+  const text = visibleText(candidate.content?.parts);
+  const toolCalls: ToolCall[] = toolCallsFromParts(candidate.content?.parts);
   const meta = json['usageMetadata'] as { promptTokenCount?: number; candidatesTokenCount?: number; totalTokenCount?: number } | undefined;
   return {
-    text: textParts.join(''),
+    text,
     toolCalls,
     finishReason: toolCalls.length > 0 ? 'tool_calls' : candidate.finishReason === 'MAX_TOKENS' ? 'length' : 'stop',
     ...(meta

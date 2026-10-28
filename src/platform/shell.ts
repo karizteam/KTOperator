@@ -48,6 +48,18 @@ export interface ResolvedShell {
   executable: string;
   /** Complete argv; the command string is always the last element. */
   argv: string[];
+  /**
+   * Windows only: hand this argv to CreateProcess exactly as written.
+   *
+   * Node normally applies MSVCRT quoting rules to every argument, which turns
+   * an embedded quote into `\"` — and cmd.exe does not understand backslash
+   * escapes, so `"C:\Program Files\node.exe" app.js` arrived as garbage and
+   * died with “is not recognized as an internal or external command”. cmd needs
+   * its own convention instead: /s strips exactly one leading and trailing
+   * quote, so the whole command travels wrapped in one extra pair and arrives
+   * byte for byte.
+   */
+  verbatim: boolean;
 }
 
 function winSystemExe(env: Record<string, string | undefined>, fileName: string): string {
@@ -76,7 +88,16 @@ export function resolveShell(requested: string, command: string, env: ShellEnv):
         });
       }
       const executable = winSystemExe(env.env, 'cmd.exe');
-      return { kind, label: 'cmd.exe (Windows command prompt)', executable, argv: [executable, '/d', '/s', '/c', command] };
+      // Verbatim args leave the executable unquoted too, so it is only safe
+      // when its own path has no spaces (SystemRoot never does in practice).
+      const verbatim = !/\s/.test(executable);
+      return {
+        kind,
+        label: 'cmd.exe (Windows command prompt)',
+        executable,
+        argv: verbatim ? [executable, '/d', '/s', '/c', `"${command}"`] : [executable, '/d', '/s', '/c', command],
+        verbatim,
+      };
     }
     case 'powershell': {
       if (env.platform === 'win32') {
@@ -86,6 +107,7 @@ export function resolveShell(requested: string, command: string, env: ShellEnv):
           label: 'PowerShell',
           executable,
           argv: [executable, '-NoProfile', '-NonInteractive', '-Command', command],
+          verbatim: false,
         };
       }
       const executable = findOnPath(env, ['pwsh', 'powershell']);
@@ -94,7 +116,7 @@ export function resolveShell(requested: string, command: string, env: ShellEnv):
           hint: 'Install PowerShell Core (pwsh), or use shell="bash" or shell="sh".',
         });
       }
-      return { kind, label: 'PowerShell Core', executable, argv: [executable, '-NoProfile', '-NonInteractive', '-Command', command] };
+      return { kind, label: 'PowerShell Core', executable, argv: [executable, '-NoProfile', '-NonInteractive', '-Command', command], verbatim: false };
     }
     case 'bash': {
       // Git Bash / WSL-style bash exists on Windows too; use it when present.
@@ -107,7 +129,7 @@ export function resolveShell(requested: string, command: string, env: ShellEnv):
         }
         return resolveShell('sh', command, env);
       }
-      return { kind, label: 'bash', executable, argv: [executable, '-c', command] };
+      return { kind, label: 'bash', executable, argv: [executable, '-c', command], verbatim: false };
     }
     case 'sh': {
       const executable = findOnPath(env, ['sh']) ?? (env.platform === 'win32' ? null : '/bin/sh');
@@ -116,7 +138,7 @@ export function resolveShell(requested: string, command: string, env: ShellEnv):
           hint: 'On Windows use shell="cmd" or shell="powershell".',
         });
       }
-      return { kind, label: 'sh (POSIX shell)', executable, argv: [executable, '-c', command] };
+      return { kind, label: 'sh (POSIX shell)', executable, argv: [executable, '-c', command], verbatim: false };
     }
     default:
       throw new ToolExecutionError('run_shell_command', `Unknown shell "${requested}".`, {
@@ -212,6 +234,84 @@ export function commandWarnings(command: string, limit = 4): string[] {
     out.push('deletes by wildcard — check the pattern');
   }
   return out;
+}
+
+/**
+ * A shell invocation expressed as structured argv instead of a command
+ * string: `["cmd", "/c", "ipconfig"]`. Models produce both shapes for the
+ * same request, so both are understood — the difference is only how the
+ * command text is recovered, never whether it runs.
+ */
+export interface HostShellPlan {
+  kind: ShellKind;
+  label: string;
+  command: string;
+  /** Ready-to-spawn argv (shell executable + flags + the command text). */
+  argv: string[];
+  /** Windows: the argv is already quoted exactly as cmd expects. */
+  verbatim: boolean;
+  warnings: string[];
+}
+
+/** Bare executable identity: no directory, no `.exe`, lowercase. */
+function shellName(exe: string): string {
+  const first = exe.trim().split(/\s+/)[0] ?? '';
+  return (first.replace(/\\/g, '/').split('/').pop() ?? '').replace(/\.exe$/i, '').toLowerCase();
+}
+
+/** The shell kind an executable name stands for, or null for a normal program. */
+export function shellKindForExecutable(exe: string): ShellKind | null {
+  switch (shellName(exe)) {
+    case 'cmd':
+    case 'command':
+      return 'cmd';
+    case 'powershell':
+    case 'pwsh':
+      return 'powershell';
+    case 'bash':
+    case 'zsh':
+    case 'fish':
+    case 'ksh':
+    case 'dash':
+    case 'ash':
+      return 'bash';
+    case 'sh':
+      return 'sh';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Recover the command text from a shell argv: `cmd /c` → the arguments after
+ * `/c`; `bash -lc` → everything after `-lc`. A shell invoked with only a
+ * command (`["cmd", "dir"]`) is accepted too, because that is what it means.
+ * Returns null when there is nothing to run (`["cmd"]` with no arguments).
+ */
+export function shellCommandFromArgv(argv: readonly string[]): { kind: ShellKind; command: string } | null {
+  const exe = argv[0] ?? '';
+  const kind = shellKindForExecutable(exe);
+  if (kind === null) return null;
+  const rest = argv.slice(1).map((a) => String(a));
+  if (rest.length === 0) return null;
+  // -c, -lc, -Command, /c, /k … introduce the command text that follows them.
+  const flagAt = rest.findIndex((a) => /^(-[a-z]*c[a-z]*|\/c|\/k|-command)$/i.test(a.trim()));
+  const command = (flagAt >= 0 ? rest.slice(flagAt + 1) : rest).join(' ').trim();
+  return command === '' ? null : { kind, command };
+}
+
+/** Resolve a shell + command pair into a complete, warn-annotated plan. */
+export function planHostShell(requested: string, command: string, env: ShellEnv = shellEnv()): HostShellPlan {
+  const validated = validateShellCommand(command);
+  const shell = resolveShell(requested, validated, env);
+  return {
+    kind: shell.kind,
+    label: shell.label,
+    command: validated,
+    argv: shell.argv,
+    verbatim: shell.verbatim,
+    warnings: commandWarnings(validated),
+  };
 }
 
 const MAX_COMMAND_LENGTH = 8_000;

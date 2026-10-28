@@ -1,5 +1,7 @@
 import { ToolExecutionError } from '../errors/errors.js';
 import { isShellExecutable } from '../core/execution/managed-process.js';
+import { planHostShell, shellCommandFromArgv, type HostShellPlan } from '../platform/shell.js';
+import { executeHostShell, shellPreview, shellTimeout } from './shell.js';
 import {
   isProtectedPid,
   listHostProcesses,
@@ -12,7 +14,7 @@ import type { Tool, ToolContext, ToolDescription, ToolResult } from './types.js'
 export const executeApprovedCommandTool: Tool = {
   name: 'execute_approved_command',
   description:
-    'Run a command inside the sandbox after explicit user approval. argv must be a structured array (executable + arguments); shell interpreters are refused; the workspace is the only visible directory; network stays as configured.',
+    'Run a command after explicit user approval. argv must be a structured array (executable + arguments); the workspace is the only visible directory and network stays as configured. For real programs (npm, git, node, a script) it runs inside the sandbox. When argv is a shell invocation — ["cmd", "/c", "ipconfig"], ["bash", "-lc", "df -h"] — there is no sandbox to run it in, so it runs on the user\'s own machine with the same approval, and the prompt says so. Prefer run_shell_command when the user asked for a command line in words; either way nothing runs before the user approves the exact text.',
   requiresWorkspace: true,
   schema: {
     type: 'object',
@@ -21,7 +23,7 @@ export const executeApprovedCommandTool: Tool = {
     properties: {
       argv: {
         type: 'array',
-        description: 'Executable followed by its arguments, e.g. ["ls", "-la"]. Never a shell string; shells are refused.',
+        description: 'Executable followed by its arguments, e.g. ["ls", "-la"], or a shell invocation such as ["cmd", "/c", "ipconfig"].',
         minItems: 1,
         maxItems: 100,
         items: { type: 'string', minLength: 1, maxLength: 4096 },
@@ -30,8 +32,17 @@ export const executeApprovedCommandTool: Tool = {
       timeoutMs: { type: 'integer', description: 'Max runtime (default 120000).', minimum: 1000, maximum: 900_000 },
     },
   },
-  describe(input) {
+  describe(input, ctx) {
     const argv = (input['argv'] as string[]).join(' ');
+    const shellPlan = tryShellPlan(input['argv']);
+    if (shellPlan !== null) {
+      const cwd = ctx.workspace?.root ?? process.cwd();
+      return {
+        summary: `Run on your machine (${shellPlan.kind}): ${shellPlan.command.slice(0, 80)}`,
+        targets: [argv],
+        preview: shellPreview(shellPlan, cwd, shellTimeout(input['timeoutMs'])),
+      };
+    }
     return {
       summary: `Execute command: ${argv}`,
       targets: [argv],
@@ -41,9 +52,22 @@ export const executeApprovedCommandTool: Tool = {
   async run(input, ctx): Promise<ToolResult> {
     const argv = input['argv'] as string[];
     const exe = argv[0]!;
-    if (/\s/.test(exe) || isShellExecutable(exe)) {
-      throw new ToolExecutionError('execute_approved_command', `Refusing to run a shell command string or interpreter: ${exe}.`, {
-        hint: 'Provide the real executable as argv[0] and each argument as its own array element.',
+    if (/\s/.test(exe)) {
+      throw new ToolExecutionError('execute_approved_command', `Refusing a command string in argv[0]: ${exe}.`, {
+        hint: 'Put the executable in argv[0] and each argument in its own element, e.g. ["git", "status"], or use run_shell_command for a real command line.',
+      });
+    }
+    // A shell invocation is not sandboxable: run it on the host, with the same
+    // tier-3 approval and an honest "outside the sandbox" prompt, instead of
+    // failing with "refusing to run a shell" whenever the model chooses argv.
+    const shellPlan = tryShellPlan(argv);
+    if (shellPlan !== null) {
+      const cwd = ctx.workspace?.root ?? process.cwd();
+      return executeHostShell(shellPlan, ctx, cwd, shellTimeout(input['timeoutMs']), 'execute_approved_command', { via: 'argv' });
+    }
+    if (isShellExecutable(exe)) {
+      throw new ToolExecutionError('execute_approved_command', `Refusing an unsupported shell invocation: ${exe}.`, {
+        hint: 'Pass the command after /c (cmd) or -c (bash/sh/PowerShell), e.g. ["cmd", "/c", "dir"], or call run_shell_command.',
       });
     }
     const writable = (input['writable'] as boolean | undefined) ?? ctx.config.sandbox.writableDefault;
@@ -105,7 +129,8 @@ export const inspectCommandResultTool: Tool = {
 
 export const terminateManagedProcessTool: Tool = {
   name: 'terminate_managed_process',
-  description: 'Terminate a still-running process that Operator itself started (by id). Arbitrary host processes can never be targeted.',
+  description:
+    'Stop a process Operator itself started, by id — a still-running command, or a background job from start_background_process (the whole process tree is killed). Use it when the user asks to stop the server/watcher, when a port must be freed, or before starting the same job again. Arbitrary host processes can never be targeted; to close an application the user is running, use close_app.',
   schema: {
     type: 'object',
     additionalProperties: false,
@@ -116,15 +141,17 @@ export const terminateManagedProcessTool: Tool = {
     return { summary: `Terminate managed process ${input['id'] as string}`, targets: [input['id'] as string] };
   },
   async run(input, ctx) {
-    const ok = await ctx.sandbox.runner.terminate(input['id'] as string);
+    const id = input['id'] as string;
+    const ok = await ctx.sandbox.runner.terminate(id);
     if (!ok) {
       return {
         ok: false,
         summary: 'Process not running.',
-        error: `No running managed process with id ${input['id'] as string}. Only Operator-managed processes can be terminated.`,
+        error: `No running process with id ${id}. Only Operator-managed processes (run_shell_command, start_background_process) can be terminated.`,
       };
     }
-    return { ok: true, summary: `Termination requested for managed process ${input['id'] as string}.` };
+    await ctx.audit.record({ event: 'process.terminate', tool: 'terminate_managed_process', tier: 2, detail: { id } });
+    return { ok: true, summary: `Termination requested for managed process ${id}.` };
   },
 };
 
@@ -136,6 +163,23 @@ export const terminateManagedProcessTool: Tool = {
  * a similar name. System-critical pids and Operator's own process tree are
  * refused outright, and matching is name-based, never a shell or wildcard.
  */
+
+/**
+ * Plan a shell invocation from structured argv, or null when the argv is an
+ * ordinary program. Never throws: `describe` must not fail while the user is
+ * deciding whether to approve.
+ */
+function tryShellPlan(raw: unknown): HostShellPlan | null {
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const argv = raw.map((a) => String(a));
+  const parsed = shellCommandFromArgv(argv);
+  if (parsed === null) return null;
+  try {
+    return planHostShell(parsed.kind, parsed.command);
+  } catch {
+    return null;
+  }
+}
 
 const MAX_NAME_LENGTH = 128;
 

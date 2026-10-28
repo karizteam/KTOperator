@@ -372,8 +372,20 @@ function normalizeSearch(tool: string, raw: string): string {
   return text;
 }
 
-function winSystemExe(env: Record<string, string | undefined>, fileName: string): string {
-  return path.win32.join(env['SystemRoot'] ?? env['windir'] ?? 'C:\\Windows', 'System32', fileName);
+/**
+ * Locate a Windows system executable. Most live in `System32`, but a few —
+ * `explorer.exe` above all — sit directly in `%SystemRoot%`, so hard-coding
+ * System32 produced `spawn ENOENT` and "the app never opens". The first
+ * candidate that really exists wins; if none does, the last one is returned so
+ * the failure names a concrete path.
+ */
+function winExe(deps: DesktopEnv, fileName: string): string {
+  const root = deps.env['SystemRoot'] ?? deps.env['windir'] ?? 'C:\\Windows';
+  const candidates = [path.win32.join(root, fileName), path.win32.join(root, 'System32', fileName)];
+  for (const candidate of candidates) {
+    if (deps.exists(candidate)) return candidate;
+  }
+  return candidates[candidates.length - 1]!;
 }
 
 function macOpen(app: string | null, args: string[]): string[] {
@@ -407,7 +419,7 @@ export function buildLaunchPlan(appId: string, options: LaunchOptions = {}, deps
         ? macOpen(null, [uri])
         : platform === 'linux'
           ? ['xdg-open', uri]
-          : [winSystemExe(deps.env, 'explorer.exe'), uri];
+          : [winExe(deps, 'explorer.exe'), uri];
     return {
       app: resolved.id,
       label: resolved.label,
@@ -460,7 +472,7 @@ export function buildOpenUrlPlan(rawUrl: string, browser: string, deps: DesktopE
   const { platform } = deps;
   const argv =
     platform === 'win32'
-      ? [winSystemExe(deps.env, 'rundll32.exe'), 'url.dll,FileProtocolHandler', url]
+      ? [winExe(deps, 'rundll32.exe'), 'url.dll,FileProtocolHandler', url]
       : platform === 'darwin'
         ? ['open', url]
         : ['xdg-open', url];
@@ -513,7 +525,18 @@ const BLOCKED_EXECUTABLES = new Set([
 ]);
 
 /** Start-menu labels that are really shells even though the file is a .lnk. */
-const BLOCKED_LABEL_PREFIXES = ['commandprompt', 'powershell', 'pwsh', 'windowsterminal', 'wsl', 'cmdexe'];
+const BLOCKED_LABEL_PREFIXES = ['commandprompt', 'powershell', 'pwsh', 'windowsterminal', 'wsl', 'cmdexe', 'gitbash', 'gitcmd', 'nodecommand', 'nodeprompt'];
+
+/**
+ * Words that make an installed item a shell/terminal rather than an app.
+ * Real Start Menus are full of them — "Git Bash", "Git CMD", "Node.js command
+ * prompt", "Windows PowerShell ISE (x86)", "Run" — and each one would hand the
+ * model an unrestricted prompt if it were launched.
+ */
+const BLOCKED_WORDS = new Set([
+  'bash', 'cmd', 'powershell', 'pwsh', 'terminal', 'console', 'shell', 'wsl',
+  'conhost', 'cscript', 'wscript', 'mshta', 'runas', 'cmdline',
+]);
 
 const SHORTCUT_SKIP_RE = /(uninstall|remove|repair|read ?me|release ?notes|documentation|manual|help|website|home ?page|support|licen[cs]e|upgrade|update|modify|setup|wizard)/i;
 
@@ -535,6 +558,11 @@ export function isBlockedLaunch(value: string): boolean {
   const base = baseName(value).trim().toLowerCase().replace(/\.(exe|com|bat|cmd|lnk|ps1)$/, '');
   if (base === '') return false;
   if (BLOCKED_EXECUTABLES.has(base)) return true;
+  // "Run" is the Windows shell's own launcher dialog.
+  if (normalizeAppName(base) === 'run') return true;
+  if (/command\s*prompt/i.test(base)) return true;
+  const words = base.split(/[^a-z0-9\u0600-\u06ff]+/).filter((w) => w !== '');
+  if (words.some((word) => BLOCKED_WORDS.has(word))) return true;
   const label = normalizeAppName(base);
   return BLOCKED_LABEL_PREFIXES.some((prefix) => label.startsWith(prefix));
 }
@@ -690,6 +718,51 @@ function windowsShortcutApps(deps: DesktopEnv): DiscoveredApp[] {
   return out;
 }
 
+/**
+ * Folders where Windows software really installs itself. Plenty of apps —
+ * Opera GX, Discord, VS Code, most Electron products — live here without ever
+ * creating a Start Menu entry, which is why name lookup used to report them as
+ * "not installed" on a machine that had them.
+ */
+function windowsInstallRoots(deps: DesktopEnv): string[] {
+  const local = deps.env['LOCALAPPDATA'] ?? '';
+  const roots = [
+    local !== '' ? path.win32.join(local, 'Programs') : '',
+    deps.env['ProgramFiles'] ?? deps.env['PROGRAMFILES'] ?? '',
+    deps.env['ProgramFiles(x86)'] ?? '',
+  ].filter((root) => root !== '');
+  return roots;
+}
+
+/** Executables that are parts of an installer or a background helper. */
+const INSTALL_EXE_SKIP_RE = /(unins|uninstall|setup|updat|crash|report|plugin|helper|service|daemon|telemetry|vcredist|vc_redist|elevat|register|remove|repair|notification)/i;
+
+function windowsInstalledApps(deps: DesktopEnv): DiscoveredApp[] {
+  const out: DiscoveredApp[] = [];
+  const seen = new Set<string>();
+  for (const root of windowsInstallRoots(deps)) {
+    for (const entry of walk(deps, root, 3)) {
+      if (!/\.exe$/i.test(entry)) continue;
+      const stem = baseName(entry).replace(/\.exe$/i, '').trim();
+      if (stem.length < 3 || INSTALL_EXE_SKIP_RE.test(stem)) continue;
+      const key = normalizeAppName(stem);
+      if (key === '' || seen.has(key) || isBlockedLaunch(stem)) continue;
+      seen.add(key);
+      // "…\Opera GX\opera.exe": people say "Opera GX", the file says "opera".
+      const parent = baseName(path.win32.dirname(entry)).trim();
+      const alias = parent.toLowerCase() !== stem.toLowerCase() && !/^(programs|bin|app|application|current|resources|dist|lib)$/i.test(parent) ? parent : '';
+      out.push({
+        name: stem,
+        kind: 'utility',
+        launch: { how: 'exec', executable: entry, acceptsTarget: true },
+        source: entry,
+        ...(alias !== '' ? { aliases: [alias] } : {}),
+      });
+    }
+  }
+  return out;
+}
+
 function macBundleApps(deps: DesktopEnv): DiscoveredApp[] {
   const out: DiscoveredApp[] = [];
   const seen = new Set<string>();
@@ -730,7 +803,11 @@ function linuxDesktopApps(deps: DesktopEnv): DiscoveredApp[] {
 /** Every application the machine can find for this platform. */
 export function discoverApps(deps: DesktopEnv = desktopEnv()): DiscoveredApp[] {
   const platformApps =
-    deps.platform === 'win32' ? windowsShortcutApps(deps) : deps.platform === 'darwin' ? macBundleApps(deps) : linuxDesktopApps(deps);
+    deps.platform === 'win32'
+      ? [...windowsShortcutApps(deps), ...windowsInstalledApps(deps)]
+      : deps.platform === 'darwin'
+        ? macBundleApps(deps)
+        : linuxDesktopApps(deps);
   return [...catalogDiscoveredApps(deps), ...platformApps];
 }
 
@@ -786,8 +863,19 @@ export function matchDiscoveredApps(apps: readonly DiscoveredApp[], query: strin
     scored.push({ app, score });
   }
   return scored
-    .sort((a, b) => a.score - b.score || a.app.name.length - b.app.name.length || a.app.name.localeCompare(b.app.name))
+    .sort(
+      (a, b) =>
+        a.score - b.score ||
+        launchRank(a.app) - launchRank(b.app) ||
+        a.app.name.length - b.app.name.length ||
+        a.app.name.localeCompare(b.app.name),
+    )
     .map((s) => s.app);
+}
+
+/** Equal matches prefer a direct executable over an explorer→.lnk round-trip. */
+function launchRank(app: DiscoveredApp): number {
+  return app.launch.how === 'windows-shortcut' ? 1 : 0;
 }
 
 function looksLikePath(value: string): boolean {
@@ -881,7 +969,7 @@ export function buildDiscoveredLaunchPlan(app: DiscoveredApp, options: LaunchOpt
       argv = [app.launch.executable, ...(target === '' ? [] : [target])];
       break;
     case 'windows-shortcut':
-      argv = [winSystemExe(deps.env, 'explorer.exe'), app.launch.path];
+      argv = [winExe(deps, 'explorer.exe'), app.launch.path];
       break;
     case 'mac-bundle':
       argv = macOpen(null, [app.launch.path, ...(target === '' ? [] : [target])]);

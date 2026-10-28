@@ -42,7 +42,28 @@ You ran with `--json` or in a non-TTY context without `--yes`. Either drop
 
 429s are retried with `Retry-After` up to 3 attempts; then the run fails with
 a `rate_limit` error. 402 means provider credits are exhausted — top up or
-switch the profile explicitly; Operator never fails over on its own.
+switch the profile explicitly.
+
+Operator never fails over on its own. If you *want* that, opt in:
+
+```bash
+operator config set fallback.enabled true
+operator config set fallback.order openrouter,openai
+```
+
+Transient failures (rate limit, credits, network, timeout, 5xx) then continue
+on the next profile and print `Provider fallback: …`; auth and other 4xx
+errors still stop with their own message, because another vendor cannot fix a
+bad key or a bad request. See [providers](providers.md).
+
+## A background process is still running
+
+Jobs started with `start_background_process` keep running on purpose. Get their
+ids with `read_process_output` (or `inspect_command_result` for one-shot
+commands) and stop them with `terminate_managed_process`; the whole tree is
+killed. Leftovers are stopped automatically when the console session or a
+one-shot `operator run` ends. If a port is still taken, the job was started
+outside Operator — close the app or process with `close_app`.
 
 ## "Model not found / not available"
 

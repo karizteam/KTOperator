@@ -13,11 +13,14 @@ Guiding principle: **the AI decides what it wants to do; Operator's security eng
 | Path traversal / absolute-path escapes | Lexical + filesystem-level containment tests; `..` and drive-absolute handled cross-platform |
 | Device files / FIFOs / sockets | Only regular files and directories are resolvable |
 | Huge files / unbounded recursion | `limits.maxFileBytes`, walk depth 8, 20k visited-entry cap, per-tool result caps |
-| Model-generated shell strings | argv-only execution; shell interpreter names refused at the tool layer and in the sandbox. The single exception is `run_shell_command`, which is tier 3, needs the user's approval for every command, and cannot run at all non-interactively |
+| Model-generated shell strings | argv-only execution inside the sandbox, which refuses interpreter names outright. A shell invocation (`run_shell_command`, or `["cmd", "/c", …]` passed to `execute_approved_command`) is not sandboxable, so it runs on the host instead — tier 3, exact text shown, per-command approval, never a session grant, and impossible without an interactive prompt |
 | Malicious npm scripts | Only pre-existing package.json scripts run, named allowlist (test/typecheck/lint/build), inside the sandbox |
-| Sandbox unavailable | Sandboxed execution is **refused** with diagnostics — no silent downgrade. `run_shell_command` is host-level by design and therefore does not depend on a sandbox, which is exactly why it is never automatic |
-| Secrets reaching a shell command | `run_shell_command` hands the child an environment allowlist (PATH, SystemRoot, TEMP, …) and drops every name matching key/token/secret/password/credential/auth/session/cookie |
+| Sandbox unavailable | Sandboxed execution is **refused** with diagnostics — no silent downgrade. Host-shell commands are host-level by design and therefore do not depend on a sandbox, which is exactly why they are never automatic |
+| Wrong-tool drift (model asks for cmd via the sandbox tool) | A shell argv handed to `execute_approved_command` is detected and routed to the same host-shell path instead of failing — with the approval prompt saying "outside the sandbox", never a fake sandbox preview |
+| Secrets reaching a shell command | Both host-shell paths hand the child an environment allowlist (PATH, SystemRoot, TEMP, …) and drop every name matching key/token/secret/password/credential/auth/session/cookie |
 | Prompt injection via files/README/command output | Untrusted-output delimiters + injection phrase screening + policy enforcement regardless of content |
+| Prompt injection via project instructions | `AGENTS.md` / `.operator/instructions.md` never enters the prompt unseen: its content is shown in full context, approved by the user, remembered by content hash (an edit is re-approved), and even then cannot grant access or approve an action |
+| Background job outliving its session or leaking a port | Jobs are Operator-managed: bounded line-oriented output, a concurrency cap (`limits.maxProcesses`), whole-tree termination, and every remaining job stopped when the run or the console session ends |
 | Secret exfiltration through the context window | Pattern-based redaction of keys/tokens/PEM blocks on all model-visible tool output |
 | API key leakage via logs/errors | Redaction on audit, error details, `config show`; keys never printed by any command |
 | SSRF through custom provider base URLs | HTTPS-only by default, no userinfo, DNS-pinning to public ranges, no redirect following, nonstandard ports require `trustedLocal` |

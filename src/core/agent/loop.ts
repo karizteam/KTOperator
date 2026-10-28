@@ -53,7 +53,8 @@ export interface AgentReport {
   toolCallsTotal: number;
   deniedCount: number;
   steps: AgentStep[];
-  usage: { promptTokens: number; completionTokens: number };
+  /** Summed across every model request in the run; cost only when reported. */
+  usage: { promptTokens: number; completionTokens: number; costUsd?: number };
   durationMs: number;
   limitReason?: string;
 }
@@ -72,6 +73,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentRepo
   let finalText = '';
   let promptTokens = 0;
   let completionTokens = 0;
+  let costUsd = 0;
   const signatureCounts = new Map<string, number>();
   const deadline = startedAt + options.maxDurationMs;
 
@@ -115,6 +117,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentRepo
       if (result.usage) {
         promptTokens += result.usage.promptTokens ?? 0;
         completionTokens += result.usage.completionTokens ?? 0;
+        costUsd += result.usage.costUsd ?? 0;
         options.onUsage?.(result.usage);
       }
       if (!stream && result.text) emitText(result.text);
@@ -197,7 +200,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentRepo
       toolCallsTotal,
       deniedCount,
       steps,
-      usage: { promptTokens, completionTokens },
+      usage: { promptTokens, completionTokens, ...(costUsd > 0 ? { costUsd } : {}) },
       durationMs: Date.now() - startedAt,
       ...(extra.limitReason ? { limitReason: extra.limitReason } : {}),
     };

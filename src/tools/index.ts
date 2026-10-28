@@ -4,6 +4,7 @@ import { developmentTools } from './development.js';
 import { systemTools } from './system.js';
 import { processTools } from './processes.js';
 import { shellTools } from './shell.js';
+import { backgroundTools } from './background.js';
 import { webFetchTool, webSearchTool } from './web.js';
 import { desktopTools } from './desktop.js';
 import { accessTools } from './access.js';
@@ -17,6 +18,7 @@ export const ALL_TOOLS: Tool[] = [
   ...systemTools,
   ...processTools,
   ...shellTools,
+  ...backgroundTools,
   webSearchTool,
   webFetchTool,
   ...desktopTools,

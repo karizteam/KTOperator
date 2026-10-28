@@ -1,13 +1,6 @@
 import { stdout } from 'node:process';
-import {
-  commandWarnings,
-  resolveShell,
-  shellEnv,
-  shellEnvironment,
-  validateShellCommand,
-  SHELL_KINDS,
-} from '../platform/shell.js';
-import type { Tool, ToolDescription, ToolResult } from './types.js';
+import { planHostShell, shellEnvironment, SHELL_KINDS, type HostShellPlan } from '../platform/shell.js';
+import type { Tool, ToolContext, ToolDescription, ToolResult } from './types.js';
 
 /**
  * run_shell_command — the escape hatch for "do it in cmd/bash".
@@ -24,40 +17,97 @@ import type { Tool, ToolDescription, ToolResult } from './types.js';
  *     bounded, redacted output; the process tree is killed on cancel;
  *   - the command id is returned, so a still-running one can be stopped with
  *     terminate_managed_process and inspected with inspect_command_result.
+ *
+ * `executeHostShell` is shared with execute_approved_command, which receives
+ * the same request as structured argv (`["cmd", "/c", "ipconfig"]`) and must
+ * behave identically instead of refusing.
  */
 
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MIN_TIMEOUT_MS = 1_000;
 const MAX_TIMEOUT_MS = 900_000;
 
-interface ShellPlan {
-  kind: string;
-  label: string;
-  argv: string[];
-  cwd: string;
-  timeoutMs: number;
-  warnings: string[];
+/** Clamp a requested timeout to the supported window. */
+export function shellTimeout(raw: unknown, fallback = DEFAULT_TIMEOUT_MS): number {
+  const value = typeof raw === 'number' && Number.isFinite(raw) ? raw : fallback;
+  return Math.max(MIN_TIMEOUT_MS, Math.min(value, MAX_TIMEOUT_MS));
 }
 
-function planCommand(input: Record<string, unknown>, cwd: string): ShellPlan {
-  const command = validateShellCommand(String(input['command'] ?? ''));
-  const requested = typeof input['shell'] === 'string' && input['shell'] !== '' ? input['shell'] : 'auto';
-  const shell = resolveShell(requested, command, shellEnv());
-  const rawTimeout = typeof input['timeoutMs'] === 'number' ? input['timeoutMs'] : DEFAULT_TIMEOUT_MS;
-  const timeoutMs = Math.max(MIN_TIMEOUT_MS, Math.min(rawTimeout, MAX_TIMEOUT_MS));
-  return { kind: shell.kind, label: shell.label, argv: shell.argv, cwd, timeoutMs, warnings: commandWarnings(command) };
-}
-
-function preview(plan: ShellPlan, command: string): string {
+/** The approval prompt body: exact text, where it runs, and any warning. */
+export function shellPreview(plan: HostShellPlan, cwd: string, timeoutMs: number): string {
   return [
-    `Runs on YOUR machine, outside the sandbox.`,
+    'Runs on YOUR machine, outside the sandbox.',
     `Shell     : ${plan.label}`,
-    `Directory : ${plan.cwd}`,
-    `Timeout   : ${(plan.timeoutMs / 1000).toFixed(0)}s`,
+    `Directory : ${cwd}`,
+    `Timeout   : ${(timeoutMs / 1000).toFixed(0)}s`,
     '',
-    command,
+    plan.command,
     ...(plan.warnings.length > 0 ? ['', ...plan.warnings.map((w) => `⚠ ${w}`)] : []),
   ].join('\n');
+}
+
+/**
+ * Run one host-shell plan and normalise the outcome for the model. Used by
+ * both shell-facing tools so a command behaves the same whichever name the
+ * model happened to call.
+ */
+export async function executeHostShell(
+  plan: HostShellPlan,
+  ctx: ToolContext,
+  cwd: string,
+  timeoutMs: number,
+  tool: string,
+  extra: Record<string, unknown> = {},
+): Promise<ToolResult> {
+  await ctx.audit.record({
+    event: 'command.execute',
+    tool,
+    tier: 3,
+    detail: { host: true, shell: plan.kind, cwd, command: plan.command.slice(0, 500), warnings: plan.warnings, ...extra },
+  });
+
+  const result = await ctx.sandbox.runner.run({
+    argv: plan.argv,
+    cwd,
+    env: shellEnvironment(process.env),
+    timeoutMs,
+    maxOutputBytes: ctx.config.limits.maxOutputBytes,
+    ...(plan.verbatim ? { windowsVerbatim: true } : {}),
+    ...(ctx.signal ? { signal: ctx.signal } : {}),
+  });
+
+  const tail = (s: string): string => {
+    const lines = s.trim().split('\n').slice(-40).join('\n');
+    return lines.length > 16_000 ? `[truncated]\n${lines.slice(-16_000)}` : lines;
+  };
+  const status = [
+    `exit ${result.exitCode ?? 'no code'}`,
+    result.timedOut ? 'timed out and was killed' : '',
+    result.aborted ? 'cancelled' : '',
+  ]
+    .filter((s) => s !== '')
+    .join(', ');
+  const summary = `Command ${status} in ${(result.durationMs / 1000).toFixed(1)}s (${plan.kind}). Process id: ${result.id}.`;
+  const data = {
+    id: result.id,
+    shell: plan.kind,
+    exitCode: result.exitCode,
+    timedOut: result.timedOut,
+    aborted: result.aborted,
+    outputTruncated: result.outputTruncated,
+    stdout: tail(result.stdout),
+    stderr: tail(result.stderr),
+  };
+  const succeeded = result.exitCode === 0 && !result.timedOut && !result.aborted;
+  if (!succeeded) {
+    return {
+      ok: false,
+      summary,
+      error: `${tail(result.stderr) || tail(result.stdout) || '(no output)'}`.slice(0, 4_000),
+      data,
+    };
+  }
+  return { ok: true, summary, data };
 }
 
 export const runShellCommandTool: Tool = {
@@ -90,76 +140,29 @@ export const runShellCommandTool: Tool = {
   },
   async describe(input, ctx): Promise<ToolDescription> {
     const cwd = ctx.workspace?.root ?? process.cwd();
-    let plan: ShellPlan;
+    const command = String(input['command'] ?? '').trim();
+    const requested = typeof input['shell'] === 'string' && input['shell'] !== '' ? input['shell'] : 'auto';
+    let plan: HostShellPlan;
     try {
-      plan = planCommand(input, cwd);
+      plan = planHostShell(requested, command);
     } catch (err) {
       return {
-        summary: `Run command (invalid): ${String(input['command'] ?? '').slice(0, 80)}`,
+        summary: `Run command (invalid): ${command.slice(0, 80)}`,
         targets: [],
         preview: (err as Error).message,
       };
     }
-    const command = String(input['command'] ?? '').trim();
     return {
       summary: `Run on your machine (${plan.kind}): ${firstLine(command)}`,
       targets: [firstLine(command)],
-      preview: preview(plan, command),
+      preview: shellPreview(plan, cwd, shellTimeout(input['timeoutMs'])),
     };
   },
   async run(input, ctx): Promise<ToolResult> {
     const cwd = ctx.workspace?.root ?? process.cwd();
-    const plan = planCommand(input, cwd);
-    const command = String(input['command'] ?? '').trim();
-
-    await ctx.audit.record({
-      event: 'command.execute',
-      tool: 'run_shell_command',
-      tier: 3,
-      detail: { host: true, shell: plan.kind, cwd, command: command.slice(0, 500), warnings: plan.warnings },
-    });
-
-    const result = await ctx.sandbox.runner.run({
-      argv: plan.argv,
-      cwd,
-      env: shellEnvironment(process.env),
-      timeoutMs: plan.timeoutMs,
-      maxOutputBytes: ctx.config.limits.maxOutputBytes,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    });
-
-    const tail = (s: string): string => {
-      const lines = s.trim().split('\n').slice(-40).join('\n');
-      return lines.length > 16_000 ? `[truncated]\n${lines.slice(-16_000)}` : lines;
-    };
-    const status = [
-      `exit ${result.exitCode ?? 'no code'}`,
-      result.timedOut ? 'timed out and was killed' : '',
-      result.aborted ? 'cancelled' : '',
-    ]
-      .filter((s) => s !== '')
-      .join(', ');
-    const summary = `Command ${status} in ${(result.durationMs / 1000).toFixed(1)}s (${plan.kind}). Process id: ${result.id}.`;
-    const data = {
-      id: result.id,
-      shell: plan.kind,
-      exitCode: result.exitCode,
-      timedOut: result.timedOut,
-      aborted: result.aborted,
-      outputTruncated: result.outputTruncated,
-      stdout: tail(result.stdout),
-      stderr: tail(result.stderr),
-    };
-    const succeeded = result.exitCode === 0 && !result.timedOut && !result.aborted;
-    if (!succeeded) {
-      return {
-        ok: false,
-        summary,
-        error: `${tail(result.stderr) || tail(result.stdout) || '(no output)'}`.slice(0, 4_000),
-        data,
-      };
-    }
-    return { ok: true, summary, data };
+    const requested = typeof input['shell'] === 'string' && input['shell'] !== '' ? input['shell'] : 'auto';
+    const plan = planHostShell(requested, String(input['command'] ?? ''));
+    return executeHostShell(plan, ctx, cwd, shellTimeout(input['timeoutMs']), 'run_shell_command');
   },
 };
 

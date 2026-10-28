@@ -12,6 +12,13 @@ export interface ToolCall {
   name: string;
   /** Raw JSON argument string exactly as produced by the model. */
   arguments: string;
+  /**
+   * Opaque provider metadata that has to travel back with the call unchanged.
+   * Gemini signs every function call with a `thoughtSignature` and rejects the
+   * follow-up request if it is missing, so it is stored here and replayed by
+   * adapters that understand it. Other providers ignore it.
+   */
+  signature?: string;
 }
 
 export interface ChatMessage {

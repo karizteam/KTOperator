@@ -5,6 +5,7 @@ import {
   GoogleProvider,
   normalizeGeminiModel,
   normalizeGoogleBase,
+  toGeminiContents,
   toGeminiSchema,
 } from '../../src/providers/google.js';
 import { createProvider } from '../../src/providers/registry.js';
@@ -170,5 +171,113 @@ describe('Gemini model and base normalization', () => {
   it('reports a missing key instead of sending an anonymous request', async () => {
     const provider = new GoogleProvider(profile, null, { lookupImpl: PUBLIC_LOOKUP });
     await assert.rejects(() => provider.chat(baseReq()), /API key is not configured/);
+  });
+});
+
+/**
+ * Gemini 3 signs every function call with an opaque `thoughtSignature` and
+ * answers the next turn with HTTP 400 "Function call is missing a
+ * thought_signature in functionCall parts" when it is not sent back. The
+ * adapter therefore stores the signature on the call and replays it verbatim.
+ */
+describe('Gemini thought signatures', () => {
+  it('captures the signature that comes back with each function call', async () => {
+    const { fetchImpl } = mockGemini(() => ({
+      candidates: [
+        {
+          content: {
+            parts: [
+              { functionCall: { name: 'search_files', args: { pattern: 'x' } }, thoughtSignature: 'sig-A' },
+              { functionCall: { name: 'read_file', args: { path: 'a.txt' } } },
+            ],
+          },
+          finishReason: 'STOP',
+        },
+      ],
+    }));
+    const provider = new GoogleProvider(profile, 'k', { fetchImpl, lookupImpl: PUBLIC_LOOKUP });
+    const result = await provider.chat(
+      baseReq({ tools: [{ name: 'search_files', description: 'x', parameters: { type: 'object', properties: {} } }] }),
+    );
+    assert.deepEqual(
+      result.toolCalls.map((c) => c.signature),
+      ['sig-A', undefined],
+      'an unsigned call must stay unsigned rather than get a made-up value',
+    );
+  });
+
+  it('replays a stored signature in the next request', async () => {
+    const { fetchImpl, seen } = mockGemini(() => ({
+      candidates: [{ content: { parts: [{ text: 'done' }] }, finishReason: 'STOP' }],
+    }));
+    const provider = new GoogleProvider(profile, 'k', { fetchImpl, lookupImpl: PUBLIC_LOOKUP });
+    await provider.chat(
+      baseReq({
+        messages: [
+          { role: 'user', content: 'find it' },
+          {
+            role: 'assistant',
+            content: '',
+            toolCalls: [{ id: 'gemini_0', name: 'search_files', arguments: '{"pattern":"x"}', signature: 'sig-A' }],
+          },
+          { role: 'tool', toolCallId: 'gemini_0', name: 'search_files', content: 'found' },
+        ],
+      }),
+    );
+    const body = seen[0]!.body as { contents: { role: string; parts: Record<string, unknown>[] }[] };
+    const modelTurn = body.contents.find((c) => c.role === 'model');
+    assert.equal(modelTurn?.parts[0]?.['thoughtSignature'], 'sig-A');
+    const userTurn = body.contents[body.contents.length - 1]!;
+    assert.equal((userTurn.parts[0]!['functionResponse'] as { name: string }).name, 'search_files');
+  });
+
+  it('falls back to Google\'s documented sentinel for an unsigned call', () => {
+    const { contents } = toGeminiContents([
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { id: 'a', name: 'search_files', arguments: '{}' },
+          { id: 'b', name: 'read_file', arguments: '{"path":"a"}' },
+        ],
+      },
+    ]);
+    const model = JSON.stringify(contents[1]);
+    assert.match(model, /"thoughtSignature":"skip_thought_signature_validator"/);
+    assert.equal(model.match(/thoughtSignature/g)?.length, 1, 'only the first part of a turn needs it');
+  });
+
+  it('answers parallel tool calls in a single user turn', () => {
+    const { contents } = toGeminiContents([
+      { role: 'user', content: 'go' },
+      {
+        role: 'assistant',
+        content: '',
+        toolCalls: [
+          { id: 'a', name: 'search_files', arguments: '{}' },
+          { id: 'b', name: 'read_file', arguments: '{}' },
+        ],
+      },
+      { role: 'tool', toolCallId: 'a', name: 'search_files', content: 'r1' },
+      { role: 'tool', toolCallId: 'b', name: 'read_file', content: 'r2' },
+    ]);
+    assert.deepEqual(
+      contents.map((c) => c.role),
+      ['user', 'model', 'user'],
+      'roles must alternate; consecutive tool results merge',
+    );
+    assert.equal(contents[2]!.parts.length, 2);
+  });
+
+  it('never shows internal thinking as the answer', async () => {
+    const { fetchImpl } = mockGemini(() => ({
+      candidates: [
+        { content: { parts: [{ text: 'let me think about it', thought: true }, { text: 'Answer' }] }, finishReason: 'STOP' },
+      ],
+    }));
+    const provider = new GoogleProvider(profile, 'k', { fetchImpl, lookupImpl: PUBLIC_LOOKUP });
+    const result = await provider.chat(baseReq());
+    assert.equal(result.text, 'Answer');
   });
 });

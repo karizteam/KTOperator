@@ -23,6 +23,8 @@ const SETTABLE: Record<string, (raw: string) => unknown> = {
   'sandbox.pidsLimit': intRange(16, 4096),
   'sandbox.writableDefault': bool,
   'network.allowPrivateProviderEndpoints': bool,
+  'fallback.enabled': bool,
+  'fallback.order': list,
   'limits.maxIterations': intRange(1, 100),
   'limits.maxToolCalls': intRange(1, 500),
   'limits.maxDurationMs': intRange(10_000, 3_600_000),
@@ -34,6 +36,13 @@ const SETTABLE: Record<string, (raw: string) => unknown> = {
   'ui.color': bool,
 };
 
+function list(v: string): unknown {
+  const items = v
+    .split(',')
+    .map((item) => item.trim())
+    .filter((item) => item !== '');
+  return items;
+}
 function bool(v: string): unknown {
   if (v === 'true') return true;
   if (v === 'false') return false;

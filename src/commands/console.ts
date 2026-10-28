@@ -8,10 +8,17 @@ import { createProvider } from '../providers/registry.js';
 import { createToolRegistry } from '../tools/index.js';
 import type { ToolContext } from '../tools/types.js';
 import { buildSystemPrompt } from '../core/agent/system-prompt.js';
+import {
+  discoverInstructionFiles,
+  instructionDecisionsFor,
+  rememberInstructionDecision,
+  type InstructionFile,
+} from '../core/agent/instructions.js';
 import { runAgentLoop } from '../core/agent/loop.js';
 import { collectRunChanges, renderChangesBox } from '../core/agent/changes.js';
 import { VERSION } from '../version.js';
 import { BRAND_HEX, displayWidth, truncateToWidth } from '../cli/ui.js';
+import { addUsage, emptyTotals, formatCost, usageLabel, type UsageTotals } from '../util/usage.js';
 import type { SandboxManager } from '../sandbox/manager.js';
 import { workspaceSelect, workspaceShow } from './workspace.js';
 import { sandboxStatus } from './sandbox.js';
@@ -123,6 +130,9 @@ export async function consoleMain(rt: Runtime): Promise<number> {
   // ── Phase 2: workspace authorization ──────────────────────────────────────
   await ensureWorkspace(rt);
 
+  // ── Phase 2b: project instructions (only content the user has seen) ───────
+  rt.projectInstructions = await ensureProjectInstructions(rt, rt.config.workspace.current?.path ?? '');
+
   // ── Phase 3: sandbox (report only; read-only tools work regardless) ───────
   const sandbox = await ensureSandbox(rt);
 
@@ -148,6 +158,8 @@ export async function consoleMain(rt: Runtime): Promise<number> {
   const history: ChatMessage[] = [];
   /** Earlier prompts, newest last — recalled with ↑/↓ in the input box. */
   const promptHistory: string[] = [];
+  /** Tokens and cost for the whole console session, shown in the chat box. */
+  const spend: UsageTotals = emptyTotals();
   let taskController: AbortController | null = null;
   let taskRunning = false;
   let exitRequested = false;
@@ -189,7 +201,7 @@ export async function consoleMain(rt: Runtime): Promise<number> {
     while (!exitRequested) {
       let input: string;
       try {
-        input = (await ask(rt, stack, promptHistory)).trim();
+        input = (await ask(rt, stack, promptHistory, usageLabel(spend))).trim();
       } catch (err) {
         if (err instanceof UserCancelledError) {
           if (exitRequested) break;
@@ -236,6 +248,7 @@ export async function consoleMain(rt: Runtime): Promise<number> {
           audit,
           history,
           input,
+          spend,
           setController: (c) => (taskController = c),
         });
       } catch (err) {
@@ -258,6 +271,9 @@ export async function consoleMain(rt: Runtime): Promise<number> {
   } finally {
     offUiInterrupt();
     offSigint();
+    // A server started by the agent must not outlive the session silently.
+    const stopped = sandbox.runner.stopAllBackground();
+    if (stopped > 0) rt.ui.info(rt.ui.dim(`  stopped ${stopped} background process${stopped === 1 ? '' : 'es'}`));
   }
 
   rt.ui.info(`  ${rt.ui.brandLight('✦')} ${rt.ui.dim('Goodbye')}`);
@@ -413,7 +429,7 @@ function finishStack(rt: Runtime, profile: ProviderProfile, model: string): Prom
 }
 
 async function buildConsoleStack(rt: Runtime, profile: ProviderProfile, model: string): Promise<ConsoleStack> {
-  const provider = await rt.buildProvider(profile);
+  const provider = await rt.buildProviderWithFallback(profile, model);
   const boundary = await rt.workspaceBoundary();
   const sandbox = rt.makeSandbox();
   await sandbox.prepare();
@@ -424,8 +440,57 @@ async function buildConsoleStack(rt: Runtime, profile: ProviderProfile, model: s
     platform: process.platform,
     sandboxLabel: sandbox.selectedId() ?? 'none',
     toolNames: createToolRegistry().names(),
+    projectInstructions: rt.projectInstructions,
   });
   return { profile, provider, model, system };
+}
+
+/* ------------------------------------------------------------------ */
+/* Project instructions                                                */
+/* ------------------------------------------------------------------ */
+
+/** How much of one instruction file is shown before asking. */
+const INSTRUCTION_PREVIEW_LINES = 14;
+
+/**
+ * Show each instruction file once and ask before it is trusted.
+ *
+ * A file in the workspace is normally untrusted data; a cloned repository must
+ * not be able to inject instructions into the system prompt. So the user sees
+ * the content, the answer is remembered against that exact hash, and a file
+ * that changes is asked about again.
+ */
+async function ensureProjectInstructions(rt: Runtime, workspaceRoot: string): Promise<InstructionFile[]> {
+  if (workspaceRoot === '' || !rt.ui.interactive) return [];
+  const files = await discoverInstructionFiles(workspaceRoot).catch(() => []);
+  if (files.length === 0) return [];
+  const decisions = await instructionDecisionsFor(workspaceRoot).catch(() => new Map());
+  const approved: InstructionFile[] = [];
+
+  for (const file of files) {
+    const known = decisions.get(file.path);
+    if (known !== undefined && known.hash === file.hash) {
+      if (known.decision === 'allow') approved.push(file);
+      continue;
+    }
+    const lines = file.content.split('\n');
+    const shown = lines.slice(0, INSTRUCTION_PREVIEW_LINES);
+    const rest = lines.length - shown.length;
+    rt.ui.box(`project instructions · ${file.path}`, [
+      ...shown,
+      ...(rest > 0 ? [rt.ui.dim(`… ${rest} more line${rest === 1 ? '' : 's'}`)] : []),
+      '',
+      rt.ui.dim(`${file.bytes} bytes${file.truncated ? ' (only the first 16 KB are used)' : ''}`),
+    ]);
+    const load = await rt.ui.confirm(`Load ${file.path} as project instructions?`, false);
+    await rememberInstructionDecision(workspaceRoot, file.path, file.hash, load ? 'allow' : 'skip').catch(() => undefined);
+    if (load) approved.push(file);
+  }
+
+  if (approved.length > 0) {
+    rt.ui.success(`Project instructions loaded: ${approved.map((f) => f.path).join(', ')}`);
+  }
+  return approved;
 }
 
 /* ------------------------------------------------------------------ */
@@ -660,6 +725,7 @@ async function handleSlash(rt: Runtime, slash: SlashCommand, stack: ConsoleStack
         return;
       }
       await workspaceSelect(rt, path.resolve(slash.args));
+      rt.projectInstructions = await ensureProjectInstructions(rt, rt.config.workspace.current?.path ?? '');
       env.replaceStack(await buildConsoleStack(rt, stack.profile, stack.model));
       return;
     }
@@ -736,11 +802,13 @@ interface TaskDeps {
   audit: ReturnType<Runtime['makeAudit']>;
   history: ChatMessage[];
   input: string;
+  /** Session totals, updated in place so the next prompt shows them. */
+  spend: UsageTotals;
   setController: (c: AbortController) => void;
 }
 
 async function runConsoleTask(rt: Runtime, deps: TaskDeps): Promise<void> {
-  const { stack, sandbox, approval, registry, sessionId, audit, history, input } = deps;
+  const { stack, sandbox, approval, registry, sessionId, audit, history, input, spend } = deps;
   const controller = new AbortController();
   deps.setController(controller);
 
@@ -837,6 +905,7 @@ async function runConsoleTask(rt: Runtime, deps: TaskDeps): Promise<void> {
 
   history.push({ role: 'user', content: input }, ...fresh);
   if (history.length > HISTORY_CAP) history.splice(0, history.length - HISTORY_CAP);
+  addUsage(spend, report.usage);
 
   await Promise.allSettled(pending);
   await rt.sessions.appendReport(sessionId, report);
@@ -855,7 +924,8 @@ async function runConsoleTask(rt: Runtime, deps: TaskDeps): Promise<void> {
     const sep = rt.ui.brandDark(' · ');
     const tools = `${report.toolCallsTotal} tool call${report.toolCallsTotal === 1 ? '' : 's'}`;
     const denied = report.deniedCount > 0 ? `${sep}${report.deniedCount} denied` : '';
-    rt.ui.info(`   ${rt.ui.dim(`${tools}${denied}`)}${sep}${rt.ui.dim(`${(report.durationMs / 1000).toFixed(1)}s`)}`);
+    const runCost = report.usage.costUsd !== undefined && report.usage.costUsd > 0 ? `${sep}${rt.ui.dim(formatCost(report.usage.costUsd))}` : '';
+    rt.ui.info(`   ${rt.ui.dim(`${tools}${denied}`)}${sep}${rt.ui.dim(`${(report.durationMs / 1000).toFixed(1)}s`)}${runCost}`);
   }
 }
 
@@ -875,6 +945,9 @@ function printHeader(rt: Runtime, stack: ConsoleStack, sandboxId: string | null)
   rt.ui.info(`  ${label('provider')}${rt.ui.brand(stack.profile.id)} ${rt.ui.brandDark('·')} ${stack.model}`);
   rt.ui.info(`  ${label('workspace')}${ws}`);
   rt.ui.info(`  ${label('sandbox')}${sandboxId ? rt.ui.brandLight(sandboxId) : rt.ui.dim('none (analysis only)')}`);
+  if (rt.projectInstructions.length > 0) {
+    rt.ui.info(`  ${label('rules')}${rt.ui.brandLight(rt.projectInstructions.map((f) => f.path).join(', '))}`);
+  }
 }
 
 /** Full session dashboard, shown on demand with /status. */
@@ -892,17 +965,19 @@ function renderStatus(rt: Runtime, stack: ConsoleStack, sandboxId: string | null
     `workspace  ${wsPath}`,
     `access     ${granted}`,
     `sandbox    ${sandboxId ?? 'none (analysis only)'}`,
+    `rules      ${rt.projectInstructions.length > 0 ? rt.projectInstructions.map((f) => f.path).join(', ') : 'none (add AGENTS.md to the workspace)'}`,
     `session    ${sessionId.slice(0, 8)}${msgCount > 0 ? ` · ${msgCount} messages` : ''}`,
     `theme      ${BRAND_HEX}`,
   ]);
 }
 
 /** One chat input: a bordered text-area with an inline slash-command menu. */
-async function ask(rt: Runtime, stack: ConsoleStack, history: readonly string[]): Promise<string> {
+async function ask(rt: Runtime, stack: ConsoleStack, history: readonly string[], corner = ''): Promise<string> {
   rt.ui.info('');
   return rt.ui.promptTextArea({
     title: 'you',
     subtitle: `${stack.profile.id} · ${stack.model.split('/').pop() ?? stack.model}`,
+    ...(corner !== '' ? { corner } : {}),
     hint: [
       rt.ui.dim('↵ send'),
       rt.ui.dim('↑↓ history'),

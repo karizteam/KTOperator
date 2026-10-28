@@ -70,12 +70,33 @@ describe('workspace boundary enforcement (adversarial)', () => {
 });
 
 describe('execution guardrails', () => {
-  it('shell interpreters are refused even at the tool layer', async () => {
-    for (const shell of ['sh', 'bash', '/bin/sh -c "id"', 'cmd.exe']) {
-      const r = await call('execute_approved_command', { argv: [shell, '-c', 'echo owned'] });
-      assert.equal(r.ok, false, shell);
-      assert.match(`${r.summary} ${r.error}`, /shell/i);
+  it('a shell invocation goes to the host shell, never into the sandbox backend', async () => {
+    // `["cmd", "/c", …]` / `["sh", "-c", …]` are shell requests the model can
+    // express as argv. They are not sandboxable, so they run on the host with
+    // the same tier-3 approval — and must never reach the sandbox backend.
+    const argv = process.platform === 'win32' ? ['cmd.exe', '/c', 'echo owned'] : ['sh', '-c', 'echo owned'];
+    let sandboxCalls = 0;
+    const original = h.sandbox.execute.bind(h.sandbox);
+    h.sandbox.execute = async (spec) => {
+      sandboxCalls += 1;
+      return original(spec);
+    };
+    try {
+      const r = await call('execute_approved_command', { argv });
+      assert.equal(sandboxCalls, 0, 'a shell must not reach the sandbox backend');
+      assert.equal(r.ok, true, `${r.summary} ${r.error ?? ''}`);
+      const data = (typeof r.data === 'string' ? JSON.parse(r.data) : r.data) as { shell?: string; stdout?: string };
+      assert.equal(typeof data.shell, 'string', 'the result must report the host shell it used');
+      assert.match(data.stdout ?? '', /owned/);
+    } finally {
+      h.sandbox.execute = original;
     }
+  });
+
+  it('a whole command string in argv[0] is still refused', async () => {
+    const r = await call('execute_approved_command', { argv: ['/bin/sh -c "id"', 'x'] });
+    assert.equal(r.ok, false);
+    assert.match(`${r.summary} ${r.error}`, /command string/i);
   });
 
   it('approve-commands run only through the sandbox with bounded output', async () => {

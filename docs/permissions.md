@@ -33,10 +33,12 @@ exposing the container-runtime socket to the sandbox.
 | terminate_managed_process | 2 | Only Operator-managed ids |
 | close_app | 2 → 3 | Closes a running application/process by name or pid after approval (escalates to 3 with `force`); never system-critical pids or Operator's own process tree |
 | run_tests, run_typecheck, run_linter, run_build | 3 | Existing npm scripts only; sandboxed; network per config |
-| execute_approved_command | 3 | argv-only; no shells; sandboxed |
+| execute_approved_command | 3 | argv-only and sandboxed for real programs. A shell argv (`["cmd", "/c", "dir"]`, `["bash", "-lc", "df -h"]`) cannot be sandboxed, so it runs on the host with the same per-command approval and a prompt that says so |
 | run_shell_command | 3 | A real command line (cmd / bash / PowerShell) on the user's own machine; the exact command, shell, directory and any warning are shown before approval; per-command approval only, never a session grant, impossible without an interactive prompt (or an explicit `--yes all`) |
+| start_background_process | 3 | The same host-shell path as `run_shell_command`, except the job keeps running: starts only after the exact command/shell/directory are approved, returns an id immediately, output is a bounded tail, and the whole process tree stops with `terminate_managed_process` or when the run/session ends. The concurrency cap is `limits.maxProcesses` |
+| read_process_output | 0 | Reads the captured output of a background job Operator started; each line is handed out once and the job's state/exit code are reported |
 | request_path_access | 3 | Grant for one folder or drive outside the workspace; per-path approval, session scope. Read-only by default; `write: true` (a separate user decision) also allows create/edit/move/delete there, each still approved individually |
-| launch_app | 3 | Opens any application installed on the machine — the catalog (chrome, edge, firefox, notepad, explorer, calculator, paint, vscode, Microsoft Store) plus anything found in the Start Menu, the Applications folders, .desktop entries or PATH. Shells, script hosts and terminals are refused; no installs, no downloads |
+| launch_app | 3 | Opens any application installed on the machine — the catalog (chrome, edge, firefox, notepad, explorer, calculator, paint, vscode, Microsoft Store) plus anything found in the Start Menu, the Applications folders, .desktop entries, PATH, or the Windows install folders (`%LOCALAPPDATA%\Programs`, Program Files). Shells, script hosts and terminals are refused by name; no installs, no downloads |
 | open_url | 3 | http(s) only, no embedded credentials; opens in the user's browser (default, chrome, edge, firefox) |
 
 ### Natural language into a real command
@@ -44,7 +46,9 @@ exposing the container-runtime socket to the sandbox.
 When the user asks for something "in cmd" or "in bash" — or describes an
 operating-system task in words ("show my IP", "how much free space is left",
 "what is using port 3000", "list the biggest files here") — the agent writes the
-command that does it and calls `run_shell_command`. Nothing executes until the
+command that does it and calls `run_shell_command`. The same request expressed
+as argv (`["cmd", "/c", "ipconfig"]`) through `execute_approved_command` is
+recognised and routed to exactly the same host path. Nothing executes until the
 user approves that exact text in the tier-3 prompt, which shows:
 
 - the command, verbatim, and the shell that will run it (`cmd.exe`,
@@ -54,9 +58,9 @@ user approves that exact text in the tier-3 prompt, which shows:
   formatting, registry edits, a download piped into a shell, an install, an
   administrator escalation …).
 
-By design this is the only place a shell runs on the host: standard project
-work stays on `execute_approved_command` (argv-only, sandboxed), and the
-sandbox itself still refuses interpreters. The command runs with a filtered
+By design a shell only ever runs on the host through this path: standard
+project work stays on the sandboxed argv form, and the sandbox itself still
+refuses interpreters outright. The command runs with a filtered
 environment (no API keys are inherited), capped and redacted output, and a
 killable process tree — a still-running command is stopped with
 `terminate_managed_process` using the id it returns.
@@ -74,6 +78,20 @@ lines for creates, the argv for commands). Choices:
 Denials are returned to the model as structured tool errors ("do not retry
 the same action") and three denials stop the session — by design, Operator
 does not push against the security policy.
+
+## Project instructions (`AGENTS.md`)
+
+A workspace file is still untrusted input, so `AGENTS.md` (and
+`.operator/instructions.md`) is **never** loaded silently:
+
+- the console shows the path, the first lines and the size, and asks before the
+  content enters the system prompt;
+- the answer is remembered against the file's **content hash** — editing the
+  file means being asked again, because the approval was for what was read;
+- declining is remembered too, so the same content is not asked about twice;
+- `operator run` never prompts, so it uses only files already approved;
+- approved instructions shape *how* work is done and can never grant access,
+  approve an action, or weaken the sandbox, the tiers or anything above.
 
 ## Dynamic access outside the workspace
 

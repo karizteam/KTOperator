@@ -230,9 +230,32 @@ function winMachine(shortcuts: string[], installed: string[] = []): DesktopEnv {
       'ProgramFiles(x86)': 'C:\\PF86',
       LOCALAPPDATA: 'C:\\LA',
     },
-    exists: (p) => installed.includes(p) || shortcuts.includes(p) || p.startsWith('C:\\bin\\'),
+    // Like a real Windows install: explorer.exe sits in %SystemRoot%, not System32.
+    exists: (p) => installed.includes(p) || shortcuts.includes(p) || p.startsWith('C:\\bin\\') || p === 'C:\\Windows\\explorer.exe',
     which: (c) => (installed.includes(`which:${c}`) ? `C:\\bin\\${c}.exe` : null),
     walk: (dir) => (dir === START_MENU ? [START_MENU, ...shortcuts] : []),
+  };
+}
+
+const INSTALL_ROOT = 'C:\\LA\\Programs';
+const OPERA_EXE = `${INSTALL_ROOT}\\Opera GX\\opera.exe`;
+
+/** A Windows machine whose apps live under %LOCALAPPDATA%\\Programs, no shortcuts. */
+function winWithInstalls(exes: string[]): DesktopEnv {
+  return {
+    platform: 'win32',
+    env: {
+      ProgramData: 'C:\\PD',
+      APPDATA: 'C:\\AD',
+      LOCALAPPDATA: 'C:\\LA',
+      ProgramFiles: 'C:\\PF',
+      'ProgramFiles(x86)': 'C:\\PF86',
+      SystemRoot: 'C:\\Windows',
+      windir: 'C:\\Windows',
+      PATH: 'C:\\tools',
+    },
+    exists: (p) => exes.includes(p) || p === 'C:\\Windows\\explorer.exe',
+    walk: (dir) => (dir === INSTALL_ROOT ? exes : []),
   };
 }
 
@@ -252,8 +275,33 @@ function linuxMachine(files: Record<string, string>, present: string[] = []): De
 describe('installed application discovery', () => {
   it('opens an app that is not in the catalog, matched by its Start Menu name', () => {
     const plan = buildAppLaunchPlan('operaGX', {}, winMachine([`${START_MENU}\\Opera GX.lnk`]));
-    assert.deepEqual(plan.argv, [EXPLORER_WIN, `${START_MENU}\\Opera GX.lnk`]);
+    // %SystemRoot%\explorer.exe exists, System32\explorer.exe does not: the
+    // launcher must pick the one that is really there.
+    assert.deepEqual(plan.argv, ['C:\\Windows\\explorer.exe', `${START_MENU}\\Opera GX.lnk`]);
     assert.equal(plan.detail, 'Open Opera GX');
+  });
+
+  it('finds an app installed under %LOCALAPPDATA%\\Programs with no shortcut at all', () => {
+    const env = winWithInstalls([OPERA_EXE, `${INSTALL_ROOT}\\Opera GX\\opera_crashreporter.exe`]);
+    // "operaGX" → "…\Opera GX\opera.exe" through the folder alias.
+    for (const query of ['operaGX', 'Opera GX', 'opera gx']) {
+      assert.deepEqual(buildAppLaunchPlan(query, {}, env).argv, [OPERA_EXE], query);
+    }
+    assert.deepEqual(
+      discoverApps(env).map((a) => a.name).filter((n) => n.startsWith('opera')),
+      ['opera'],
+      'crash reporters are not apps',
+    );
+  });
+
+  it('falls back to System32 when %SystemRoot% has no explorer.exe', () => {
+    const env: DesktopEnv = {
+      platform: 'win32',
+      env: { ProgramData: 'C:\\PD', APPDATA: 'C:\\AD', SystemRoot: 'C:\\Windows' },
+      exists: () => false,
+      walk: (dir) => (dir === START_MENU ? [`${START_MENU}\\Opera GX.lnk`] : []),
+    };
+    assert.equal(buildAppLaunchPlan('opera', {}, env).argv[0], EXPLORER_WIN);
   });
 
   it('finds an app installed on PATH when there is no shortcut', () => {
@@ -267,11 +315,17 @@ describe('installed application discovery', () => {
       `${START_MENU}\\Opera Help.lnk`,
       `${START_MENU}\\Command Prompt.lnk`,
       `${START_MENU}\\Windows Terminal.lnk`,
+      `${START_MENU}\\Git Bash.lnk`,
+      `${START_MENU}\\Git CMD.lnk`,
+      `${START_MENU}\\Node.js command prompt.lnk`,
+      `${START_MENU}\\Windows PowerShell ISE (x86).lnk`,
+      `${START_MENU}\\Run.lnk`,
     ]);
     assert.equal(findInstalledApp('uninstall opera', env).app, null);
-    assert.throws(() => buildAppLaunchPlan('Command Prompt', {}, env), /Refusing to open a shell/);
-    assert.throws(() => buildAppLaunchPlan('Windows Terminal', {}, env), /Refusing to open a shell/);
-    assert.ok(!discoverApps(env).some((a) => /prompt|terminal/i.test(a.name)));
+    for (const shell of ['Command Prompt', 'Windows Terminal', 'Git Bash', 'Git CMD', 'Node.js command prompt', 'Windows PowerShell ISE']) {
+      assert.throws(() => buildAppLaunchPlan(shell, {}, env), /Refusing to open a shell/, shell);
+    }
+    assert.ok(!discoverApps(env).some((a) => /prompt|terminal|bash|cmd|powershell|^(run)$/i.test(a.name)));
   });
 
   it('suggests similar installed apps when nothing matches', () => {
@@ -328,7 +382,19 @@ describe('discovery helpers', () => {
   });
 
   it('blocks shells and script hosts, and nothing else', () => {
-    for (const blocked of ['bash', 'cmd.exe', 'powershell.exe', 'C:\\Windows\\System32\\wscript.exe', 'Windows Terminal']) {
+    for (const blocked of [
+      'bash',
+      'cmd.exe',
+      'powershell.exe',
+      'C:\\Windows\\System32\\wscript.exe',
+      'Windows Terminal',
+      // Start Menu entries that are really a shell:
+      'Git Bash',
+      'Git CMD',
+      'Node.js command prompt',
+      'Windows PowerShell ISE (x86)',
+      'Run',
+    ]) {
       assert.equal(isBlockedLaunch(blocked), true, blocked);
     }
     for (const allowed of ['opera', 'chrome.exe', 'notepad', 'C:\\PF\\Opera\\opera.exe']) {

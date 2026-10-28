@@ -58,6 +58,10 @@ export function backupsDir(): string {
 export function sandboxTempRoot(): string {
   return path.join(configHome(), 'sandbox-tmp');
 }
+/** Which project instruction files the user approved, and for which content. */
+export function instructionsStatePath(): string {
+  return path.join(configHome(), 'instructions.json');
+}
 
 const WINDOWS_FORBIDDEN_ROOT_RE = /^[A-Za-z]:[\\/]?$/;
 

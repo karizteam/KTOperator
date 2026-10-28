@@ -53,6 +53,19 @@ export const configSchema = z.object({
   defaultProvider: z.string().optional(),
   defaultModel: z.string().optional(),
   providers: z.array(providerProfileSchema).default([]),
+  /**
+   * Fallback chain: when the active provider rate-limits, runs out of credits
+   * or cannot be reached, continue the run on another configured profile
+   * instead of destroying the session. Off by default — silently answering
+   * with a different model is not something to opt someone into.
+   */
+  fallback: z
+    .object({
+      enabled: z.boolean().default(false),
+      /** Profile ids, in order. Empty = every other profile, in config order. */
+      order: z.array(z.string().min(1).max(64)).max(10).default([]),
+    })
+    .default({ enabled: false, order: [] }),
   workspace: z
     .object({
       current: workspaceRefSchema.optional(),

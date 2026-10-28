@@ -179,12 +179,48 @@ export interface TextAreaOptions {
   title?: string;
   /** Right-aligned context in the top border, e.g. "openrouter · gpt-4o". */
   subtitle?: string;
+  /**
+   * Right-most label in the top border, after the subtitle — the running cost
+   * of the session. Dropped for the subtitle's sake, never the other way
+   * around, when the terminal is too narrow.
+   */
+  corner?: string;
   /** Key hints shown under the box when no menu is open. */
   hint?: string;
   /** Return the commands to offer for the current input (empty = no menu). */
   suggestions?: (input: string) => CommandSuggestion[];
   /** Earlier prompts recalled with ↑/↓ from the first/last visual row. */
   history?: readonly string[];
+}
+
+/**
+ * Pick what fits in the chat box's top border.
+ *
+ * The right side carries the provider/model and the session's running cost. A
+ * narrow terminal must never push the border past the screen, so the labels
+ * are tried in order of usefulness — both, then the corner alone, then the
+ * subtitle alone — and nothing is drawn when even one does not fit.
+ *
+ * Pure and exported so the arithmetic can be tested without a terminal.
+ */
+export function chatBoxHeader(input: {
+  titleLen: number;
+  width: number;
+  subtitle: string;
+  corner: string;
+}): { subtitle: string; corner: string; dashes: number } | null {
+  const candidates: { subtitle: string; corner: string }[] = [];
+  if (input.subtitle !== '' && input.corner !== '') candidates.push({ subtitle: input.subtitle, corner: input.corner });
+  if (input.corner !== '') candidates.push({ subtitle: '', corner: input.corner });
+  if (input.subtitle !== '') candidates.push({ subtitle: input.subtitle, corner: '' });
+  for (const candidate of candidates) {
+    const parts = [candidate.subtitle, candidate.corner].filter((part) => part !== '');
+    const len = parts.reduce((sum, part) => sum + displayWidth(part), 0) + (parts.length > 1 ? 3 : 0);
+    // ╭ ─ space title space dashes space labels space ╮
+    const dashes = input.width - input.titleLen - len - 7;
+    if (dashes >= 3) return { subtitle: candidate.subtitle, corner: candidate.corner, dashes };
+  }
+  return null;
 }
 
 /** Outcome of one prompt-history step. Exported for tests. */
@@ -953,12 +989,18 @@ export class Ui {
         const { rows, cursorRow, cursorCol } = layout(inner);
         const titleText = this.formatPersianText(title);
         const subText = options.subtitle ? this.formatPersianText(options.subtitle) : '';
+        const cornerText = options.corner ? this.formatPersianText(options.corner) : '';
         const titleLen = displayWidth(titleText);
-        const subLen = displayWidth(subText);
-        const gap = width - titleLen - subLen - (subText ? 7 : 5);
-        const top = subText && gap >= 3
-          ? `${this.brand('╭')}${this.brandDark('─')} ${this.brandBold(titleText)} ${this.brandDark('─'.repeat(gap))} ${this.dim(subText)} ${this.brand('╮')}`
-          : `${this.brand('╭')}${this.brandDark('─')} ${this.brandBold(titleText)} ${this.brandDark('─'.repeat(Math.max(1, width - titleLen - 5)))}${this.brand('╮')}`;
+        const header = chatBoxHeader({ titleLen, width, subtitle: subText, corner: cornerText });
+        const top =
+          header === null
+            ? `${this.brand('╭')}${this.brandDark('─')} ${this.brandBold(titleText)} ${this.brandDark('─'.repeat(Math.max(1, width - titleLen - 5)))}${this.brand('╮')}`
+            : `${this.brand('╭')}${this.brandDark('─')} ${this.brandBold(titleText)} ${this.brandDark('─'.repeat(header.dashes))} ${[
+                header.subtitle !== '' ? this.dim(header.subtitle) : '',
+                header.corner !== '' ? this.brandLight(header.corner) : '',
+              ]
+                .filter((part) => part !== '')
+                .join(this.brandDark(' · '))} ${this.brand('╮')}`;
         const lines: string[] = [top];
         for (const row of rows) {
           const pad = ' '.repeat(Math.max(0, inner - displayWidth(row.text)));

@@ -25,6 +25,8 @@ export interface ManagedExecSpec {
   gid?: number;
   /** Prefix wrapper already resolved to argv (e.g. prlimit / docker run). */
   label?: string;
+  /** Windows: pass argv verbatim (a cmd.exe command line quoted by us). */
+  windowsVerbatim?: boolean;
 }
 
 export interface ManagedProcessResult {
@@ -48,6 +50,130 @@ export interface ManagedProcessInfo {
   label?: string;
 }
 
+/** How a long-running process is started (a dev server, a watcher, a build). */
+export interface BackgroundStartSpec {
+  argv: string[];
+  cwd: string;
+  env: Record<string, string>;
+  /** Total output budget per stream, in bytes; the log keeps the tail. */
+  maxOutputBytes: number;
+  /** Concurrent background jobs allowed. */
+  maxProcesses: number;
+  label?: string;
+  /** Windows: pass argv verbatim (a cmd.exe command line quoted by us). */
+  windowsVerbatim?: boolean;
+}
+
+/** Everything known about one background job, plus the output not yet read. */
+export interface BackgroundSnapshot {
+  id: string;
+  argv: string[];
+  running: boolean;
+  exitCode: number | null;
+  durationMs: number;
+  /** Complete lines produced since the previous read. */
+  stdout: string;
+  stderr: string;
+  /** A trailing line that has not ended with a newline yet. */
+  partialOut: string;
+  partialErr: string;
+  /** True when lines were already returned or dropped from the buffer. */
+  truncated: boolean;
+  /** Lines produced so far, per stream (for "more to come" context). */
+  totalOut: number;
+  totalErr: number;
+  label?: string;
+}
+
+/**
+ * A bounded, line-oriented tail of a process stream.
+ *
+ * Unlike the one-shot capture above this keeps the LAST lines (a server that
+ * logs forever must not stop logging), and hands each line out exactly once so
+ * "what happened since I last looked?" is a cheap question.
+ */
+class LogBuffer {
+  private lines: string[] = [];
+  /** Absolute index of the oldest line still held. */
+  private first = 0;
+  /** Total complete lines ever produced. */
+  private produced = 0;
+  /** Absolute index of the next line the reader has not seen. */
+  private read = 0;
+  private pending = '';
+
+  constructor(
+    private readonly maxLines: number,
+    private readonly maxLineChars = 2_000,
+  ) {}
+
+  push(chunk: Buffer): void {
+    this.pending += chunk.toString('utf8');
+    // A stream with no newlines (a progress bar, binary noise) must not grow
+    // without bound: keep the tail and fold it into one line.
+    if (this.pending.length > this.maxLineChars * 4) {
+      this.commit(this.pending.slice(-this.maxLineChars));
+      this.pending = '';
+    }
+    let at = this.pending.indexOf('\n');
+    while (at >= 0) {
+      this.commit(this.pending.slice(0, at));
+      this.pending = this.pending.slice(at + 1);
+      at = this.pending.indexOf('\n');
+    }
+  }
+
+  /** Commit a trailing fragment when the process exits. */
+  flush(): void {
+    if (this.pending !== '') {
+      this.commit(this.pending);
+      this.pending = '';
+    }
+  }
+
+  take(): { text: string; truncated: boolean } {
+    const start = Math.max(this.read, this.first);
+    const truncated = this.read < this.first;
+    const text = this.lines.slice(start - this.first).join('\n');
+    this.read = this.produced;
+    return { text, truncated };
+  }
+
+  restart(): void {
+    this.read = this.first;
+  }
+
+  partial(): string {
+    return this.pending.length > this.maxLineChars ? this.pending.slice(-this.maxLineChars) : this.pending;
+  }
+
+  total(): number {
+    return this.produced;
+  }
+
+  private commit(raw: string): void {
+    const line = raw.endsWith('\r') ? raw.slice(0, -1) : raw;
+    this.lines.push(line.length > this.maxLineChars ? `${line.slice(0, this.maxLineChars)}…` : line);
+    this.produced += 1;
+    while (this.lines.length > this.maxLines) {
+      this.lines.shift();
+      this.first += 1;
+    }
+  }
+}
+
+interface BackgroundEntry {
+  id: string;
+  argv: string[];
+  startedAt: number;
+  child: ChildProcess;
+  out: LogBuffer;
+  err: LogBuffer;
+  running: boolean;
+  exitCode: number | null;
+  label?: string;
+}
+
 /** How long a cancelled/exhausted process gets before SIGKILL. */
 const KILL_ESCALATION_MS = 3_000;
 /**
@@ -56,6 +182,9 @@ const KILL_ESCALATION_MS = 3_000;
  * Ctrl+C could leave an interactive session waiting forever.
  */
 const KILL_WATCHDOG_MS = 6_000;
+
+/** Finished jobs kept readable after they end; older ones are dropped. */
+const MAX_FINISHED_BACKGROUND = 20;
 
 const SHELL_NAMES = new Set([
   'sh', 'bash', 'zsh', 'dash', 'fish', 'ksh', 'csh', 'tcsh',
@@ -229,25 +358,224 @@ interface ActiveHandle {
 
 const HISTORY_LIMIT = 50;
 
+/**
+ * Kill a child together with everything it spawned. Best effort by design:
+ * a process we cannot reach is reported, never retried forever. Used for both
+ * one-shot commands (which settle through their own watchdog) and background
+ * jobs (which settle through their `close` event).
+ */
+function killTreeBestEffort(child: ChildProcess): void {
+  if (!child.pid) return;
+  try {
+    if (isWindows) {
+      const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' });
+      killer.on('error', () => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* gone */
+        }
+      });
+      if (typeof killer.unref === 'function') killer.unref();
+      return;
+    }
+    process.kill(-child.pid, 'SIGTERM'); // the whole group
+    const escalation = setTimeout(() => {
+      try {
+        if (child.pid) process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        /* already gone */
+      }
+    }, KILL_ESCALATION_MS);
+    if (typeof escalation.unref === 'function') escalation.unref();
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* gone */
+    }
+  }
+}
+
 export class ManagedProcessRunner {
   private readonly active = new Map<string, ActiveHandle>();
+  private readonly background = new Map<string, BackgroundEntry>();
   private readonly history: ManagedProcessResult[] = [];
 
   list(): ManagedProcessInfo[] {
-    return [...this.active.values()].map((h) => h.info);
+    return [...[...this.active.values()].map((h) => h.info), ...this.backgroundInfo()];
   }
 
   inspect(id: string): ManagedProcessInfo | ManagedProcessResult | undefined {
     const live = this.active.get(id);
     if (live) return live.info;
+    const bg = this.background.get(id);
+    if (bg) return this.toInfo(bg);
     return this.history.find((r) => r.id === id);
   }
 
   async terminate(id: string, reason = 'terminated by user'): Promise<boolean> {
     const handle = this.active.get(id);
-    if (!handle) return false;
-    handle.kill(reason);
-    return true;
+    if (handle) {
+      handle.kill(reason);
+      return true;
+    }
+    const bg = this.background.get(id);
+    if (bg && bg.running) {
+      killTreeBestEffort(bg.child);
+      return true;
+    }
+    return false;
+  }
+
+  /* ---------------------------------------------------------------- */
+  /* Long-running (background) processes                               */
+  /* ---------------------------------------------------------------- */
+
+  /**
+   * Start a command that must outlive the call — a dev server, a watcher, a
+   * build. Returns immediately with an id; output is captured in a bounded,
+   * line-oriented tail that `readBackground` hands out once per line.
+   */
+  startBackground(spec: BackgroundStartSpec): { id: string; pid: number | null; argv: string[] } {
+    if (spec.argv.length === 0) throw new SandboxError('execution', 'Empty command argv.');
+    const live = this.backgroundInfo().filter((i) => i.running).length;
+    if (live >= spec.maxProcesses) {
+      throw new SandboxError('execution', `Already running ${live} background process(es); the limit is ${spec.maxProcesses}.`, {
+        hint: 'Stop one with terminate_managed_process (its id is shown by read_process_output).',
+      });
+    }
+
+    const id = randomUUID();
+    const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
+      cwd: spec.cwd,
+      env: spec.env,
+      shell: false,
+      windowsHide: true,
+      detached: !isWindows, // own process group so the whole tree can be stopped
+      stdio: ['ignore', 'pipe', 'pipe'],
+      ...(spec.windowsVerbatim === true && isWindows ? { windowsVerbatimArguments: true } : {}),
+    });
+
+    // One line budget shared by both streams, derived from the byte cap.
+    const maxLines = Math.max(200, Math.min(5_000, Math.floor(spec.maxOutputBytes / 80)));
+    const out = new LogBuffer(maxLines);
+    const err = new LogBuffer(maxLines);
+    const entry: BackgroundEntry = {
+      id,
+      argv: spec.argv,
+      startedAt: Date.now(),
+      child,
+      out,
+      err,
+      running: true,
+      exitCode: null,
+      ...(spec.label ? { label: spec.label } : {}),
+    };
+
+    child.stdout?.on('data', (chunk: Buffer) => out.push(chunk));
+    child.stderr?.on('data', (chunk: Buffer) => err.push(chunk));
+    child.on('error', (error) => {
+      err.push(Buffer.from(`spawn error: ${error.message}\n`));
+      entry.running = false;
+    });
+    child.on('close', (code) => {
+      entry.running = false;
+      entry.exitCode = code;
+      out.flush();
+      err.flush();
+    });
+    if (typeof child.unref === 'function') child.unref();
+
+    this.background.set(id, entry);
+    this.pruneFinishedBackground();
+    this.rememberHistory();
+    return { id, pid: child.pid ?? null, argv: spec.argv };
+  }
+
+  /** Output produced since the previous read, plus the job's state. */
+  readBackground(id: string, options: { reset?: boolean } = {}): BackgroundSnapshot | null {
+    const entry = this.background.get(id);
+    if (!entry) return null;
+    if (options.reset === true) {
+      entry.out.restart();
+      entry.err.restart();
+    }
+    const out = entry.out.take();
+    const err = entry.err.take();
+    return {
+      id: entry.id,
+      argv: entry.argv,
+      running: entry.running,
+      exitCode: entry.exitCode,
+      durationMs: Date.now() - entry.startedAt,
+      stdout: out.text,
+      stderr: err.text,
+      partialOut: entry.out.partial(),
+      partialErr: entry.err.partial(),
+      truncated: out.truncated || err.truncated,
+      totalOut: entry.out.total(),
+      totalErr: entry.err.total(),
+      ...(entry.label ? { label: entry.label } : {}),
+    };
+  }
+
+  listBackground(): ManagedProcessInfo[] {
+    return this.backgroundInfo();
+  }
+
+  /** Stop every background job — called when a session ends. */
+  stopAllBackground(): number {
+    let stopped = 0;
+    for (const entry of this.background.values()) {
+      if (!entry.running) continue;
+      killTreeBestEffort(entry.child);
+      stopped += 1;
+    }
+    return stopped;
+  }
+
+  /** Drop finished jobs from the table (their output was already read). */
+  clearFinishedBackground(): void {
+    for (const [id, entry] of this.background) if (!entry.running) this.background.delete(id);
+  }
+
+  /**
+   * Keep only the most recent finished jobs.
+   *
+   * A long session that starts a server, rebuilds, restarts it … would
+   * otherwise retain every finished job's output buffer (capped per job, but
+   * unbounded in count). The newest are the ones still worth reading.
+   */
+  private pruneFinishedBackground(): void {
+    let finished = 0;
+    for (const entry of this.background.values()) if (!entry.running) finished += 1;
+    if (finished <= MAX_FINISHED_BACKGROUND) return;
+    for (const [id, entry] of this.background) {
+      if (finished <= MAX_FINISHED_BACKGROUND) return;
+      if (entry.running) continue;
+      this.background.delete(id);
+      finished -= 1;
+    }
+  }
+
+  private backgroundInfo(): ManagedProcessInfo[] {
+    return [...this.background.values()].map((entry) => this.toInfo(entry));
+  }
+
+  private toInfo(entry: BackgroundEntry): ManagedProcessInfo {
+    return {
+      id: entry.id,
+      argv: entry.argv,
+      startedAt: new Date(entry.startedAt).toISOString(),
+      running: entry.running,
+      ...(entry.label ? { label: entry.label } : {}),
+    };
+  }
+
+  /** Keep the history array from growing when only background jobs exist. */
+  private rememberHistory(): void {
+    if (this.history.length > HISTORY_LIMIT) this.history.splice(0, this.history.length - HISTORY_LIMIT);
   }
 
   async run(spec: ManagedExecSpec): Promise<ManagedProcessResult> {
@@ -264,6 +592,7 @@ export class ManagedProcessRunner {
       windowsHide: true,
       detached: !isWindows, // own process group so we can kill the tree
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(spec.windowsVerbatim === true && isWindows ? { windowsVerbatimArguments: true } : {}),
       ...(spec.uid !== undefined ? { uid: spec.uid } : {}),
       ...(spec.gid !== undefined ? { gid: spec.gid } : {}),
     });
@@ -281,7 +610,6 @@ export class ManagedProcessRunner {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (killTimer) clearTimeout(killTimer);
         if (watchdog) clearTimeout(watchdog);
         spec.signal?.removeEventListener('abort', onAbort);
         this.active.delete(id);
@@ -306,7 +634,6 @@ export class ManagedProcessRunner {
         resolve(result);
       };
 
-      let killTimer: NodeJS.Timeout | null = null;
       let watchdog: NodeJS.Timeout | null = null;
 
       /**
@@ -335,40 +662,14 @@ export class ManagedProcessRunner {
         // the only thing left on the event loop.
       };
 
+      /**
+       * Kill the tree and settle no matter what: a cancelled task must always
+       * hand control back to the console prompt, even if the OS never tells us
+       * the process died. The watchdog below is what guarantees that.
+       */
       const killTree = (_reason: string) => {
         armWatchdog();
-        if (!child.pid) return;
-        try {
-          if (isWindows) {
-            // /T kills the process tree. Never let a failed killer hang us: the
-            // watchdog above settles the call, this just makes child.kill a
-            // best-effort fallback when taskkill is unavailable.
-            const killer = spawn('taskkill', ['/pid', String(child.pid), '/T', '/F'], { shell: false, windowsHide: true, stdio: 'ignore' });
-            killer.on('error', () => {
-              try {
-                child.kill('SIGKILL');
-              } catch {
-                /* gone */
-              }
-            });
-            if (typeof killer.unref === 'function') killer.unref();
-          } else {
-            process.kill(-child.pid, 'SIGTERM'); // the whole group
-            killTimer = setTimeout(() => {
-              try {
-                if (child.pid) process.kill(-child.pid, 'SIGKILL');
-              } catch {
-                /* already gone */
-              }
-            }, KILL_ESCALATION_MS);
-          }
-        } catch {
-          try {
-            child.kill('SIGKILL');
-          } catch {
-            /* gone */
-          }
-        }
+        killTreeBestEffort(child);
       };
 
       const timer = setTimeout(() => {
@@ -391,10 +692,7 @@ export class ManagedProcessRunner {
         stderr.push(Buffer.from(`spawn error: ${err.message}`));
         finish(null, null);
       });
-      child.on('close', (code, sig) => {
-        if (killTimer) clearTimeout(killTimer);
-        finish(code, sig);
-      });
+      child.on('close', (code, sig) => finish(code, sig));
     });
   }
 }
