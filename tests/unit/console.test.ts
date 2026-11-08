@@ -62,9 +62,12 @@ describe('slash command menu', () => {
     }
   });
 
-  it('filters by prefix', () => {
+  it('filters by prefix, with substring matches ranked after', () => {
     assert.deepEqual(filterSlashCommands('/mo').map((i) => i.command), ['/model']);
-    assert.deepEqual(filterSlashCommands('/S').map((i) => i.command), ['/status', '/sandbox']);
+    const s = filterSlashCommands('/S').map((i) => i.command);
+    // Prefix matches come first (status, sandbox); fuzzy substring hits follow.
+    assert.deepEqual(s.slice(0, 2), ['/status', '/sandbox']);
+    assert.ok(s.includes('/usage') && s.includes('/resume'));
   });
 
   it('hides the menu once the command has arguments or is not a command', () => {

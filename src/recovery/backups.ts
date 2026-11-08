@@ -102,7 +102,15 @@ export class BackupManager {
 
   /** Restore every change from a session, newest first. Returns a report per file. */
   async rollback(sessionId: string): Promise<{ restored: string[]; deleted: string[]; failed: { path: string; reason: string }[] }> {
-    const entries = (await this.list(sessionId)).reverse();
+    return this.rollbackEntries(await this.list(sessionId));
+  }
+
+  /**
+   * Restore only the given entries, newest first — the engine behind
+   * checkpoints: `/undo` restores everything after a checkpoint marker.
+   */
+  async rollbackEntries(given: readonly BackupEntry[]): Promise<{ restored: string[]; deleted: string[]; failed: { path: string; reason: string }[] }> {
+    const entries = [...given].reverse();
     const restored: string[] = [];
     const deleted: string[] = [];
     const failed: { path: string; reason: string }[] = [];

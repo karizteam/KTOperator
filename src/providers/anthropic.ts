@@ -65,7 +65,9 @@ export class AnthropicProvider implements AIProvider {
       max_tokens: request.maxTokens ?? 8192,
       messages,
     };
-    if (system) body['system'] = system;
+    // Prompt caching: the system prompt is stable across turns, so mark it
+    // cacheable — cached input tokens cost far less than fresh ones.
+    if (system) body['system'] = [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }];
     if (request.tools && request.tools.length > 0) {
       body['tools'] = request.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.parameters }));
     }

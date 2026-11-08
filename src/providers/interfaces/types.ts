@@ -58,6 +58,8 @@ export interface Usage {
   totalTokens?: number;
   /** USD cost when the provider reports it (e.g. OpenRouter). */
   costUsd?: number;
+  /** Prompt tokens served from the provider prompt cache (cheaper). */
+  cachedTokens?: number;
 }
 
 export interface ChatResult {

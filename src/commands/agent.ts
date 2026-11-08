@@ -19,6 +19,7 @@ export interface AgentCommandFlags {
   yes?: string | boolean | undefined;
   dryRun?: boolean | undefined;
   maxSteps?: number | undefined;
+  tokenBudget?: number | undefined;
 }
 
 interface AgentStack {
@@ -110,6 +111,8 @@ export async function runTask(rt: Runtime, task: string, flags: AgentCommandFlag
     maxIterations: Math.min(flags.maxSteps ?? limits.maxIterations, limits.maxIterations),
     maxToolCalls: limits.maxToolCalls,
     maxDurationMs: limits.maxDurationMs,
+    tokenBudget: flags.tokenBudget ?? limits.tokenBudget,
+    ...(limits.costCapUsd !== undefined ? { costCapUsd: limits.costCapUsd } : {}),
     ...(limits.maxTokens !== undefined ? { maxTokens: limits.maxTokens } : {}),
     stream: rt.ui.interactive && stack.provider.capabilities().streaming,
     signal: rt.signal,

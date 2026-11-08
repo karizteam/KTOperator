@@ -24,6 +24,7 @@ export type AuditEventType =
   | 'file.backup'
   | 'file.restore'
   | 'sandbox.select'
+  | 'tool.description_flagged'
   | 'error';
 
 export interface AuditEvent {

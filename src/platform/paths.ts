@@ -58,6 +58,20 @@ export function backupsDir(): string {
 export function sandboxTempRoot(): string {
   return path.join(configHome(), 'sandbox-tmp');
 }
+/** Per-workspace Operator home: `<workspace>/.operator` — skills, prompts, chats. */
+export function operatorDir(workspaceRoot: string): string {
+  return path.join(path.resolve(workspaceRoot), '.operator');
+}
+export function operatorSkillsDir(workspaceRoot: string): string {
+  return path.join(operatorDir(workspaceRoot), 'skills');
+}
+export function operatorPromptsDir(workspaceRoot: string): string {
+  return path.join(operatorDir(workspaceRoot), 'prompts');
+}
+export function operatorSessionsDir(workspaceRoot: string): string {
+  return path.join(operatorDir(workspaceRoot), 'sessions');
+}
+
 /** Which project instruction files the user approved, and for which content. */
 export function instructionsStatePath(): string {
   return path.join(configHome(), 'instructions.json');

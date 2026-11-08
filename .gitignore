@@ -6,5 +6,7 @@ coverage/
 .env
 .arena/
 .docs/
-.preview/
-.versions/
+preview/
+versions/
+.freebuff/
+.cloud-attachments/

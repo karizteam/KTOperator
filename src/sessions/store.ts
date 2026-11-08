@@ -48,6 +48,17 @@ export class SessionStore {
     return id;
   }
 
+  /** Permanently delete one session (and its transcript). Returns false when it did not exist. */
+  async delete(id: string): Promise<boolean> {
+    if (id === '' || id.includes('/') || id.includes('\\') || id.includes('..')) return false;
+    try {
+      await fs.unlink(this.file(id));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async appendMessage(id: string, message: ChatMessage): Promise<void> {
     await this.append(id, { type: 'message', ts: new Date().toISOString(), message });
   }
@@ -97,6 +108,52 @@ export class SessionStore {
       }
     }
     return metas.sort((a, b) => (a.startedAt < b.startedAt ? 1 : -1)).slice(0, limit);
+  }
+
+  /** Render a session as a shareable Markdown transcript. */
+  async exportMarkdown(id: string): Promise<string> {
+    const { meta, messages, report } = await this.transcript(id);
+    if (!meta) throw new Error(`No session found with id ${id}.`);
+    const lines: string[] = [
+      `# Session ${meta.id}`,
+      '',
+      `- Task: ${meta.task}`,
+      `- Started: ${meta.startedAt}${meta.endedAt ? ` · Ended: ${meta.endedAt}` : ''}`,
+      `- Provider: ${meta.provider ?? '?'} · Model: ${meta.model ?? '?'}`,
+      `- Workspace: ${meta.workspace ?? '(none)'}`,
+      '',
+    ];
+    for (const m of messages) {
+      const label = m.role === 'tool' ? `tool:${m.name ?? '?'}` : m.role;
+      lines.push(`## ${label}`, '', m.content || '(empty)', '');
+      if (m.toolCalls?.length) lines.push(`_Called: ${m.toolCalls.map((t) => t.name).join(', ')}_`, '');
+    }
+    if (report) {
+      lines.push('## Report', '', `- Status: ${report.status}${report.limitReason ? ` (${report.limitReason})` : ''}`, `- Iterations: ${report.iterations} · Tool calls: ${report.toolCallsTotal} · Denied: ${report.deniedCount}`, `- Usage: ${report.usage.promptTokens} in / ${report.usage.completionTokens} out${report.usage.costUsd ? ` · $${report.usage.costUsd}` : ''}`, '');
+      for (const s of report.steps) for (const tc of s.toolCalls) lines.push(`- [${tc.ok ? 'x' : ' '}] ${tc.name}: ${tc.summary}`);
+      lines.push('');
+    }
+    return lines.join('\n');
+  }
+
+  /**
+   * Compressed transcript for `/resume`: keeps the first user task, the last
+   * 6 turns verbatim, and one-line summaries of everything older — so a
+   * resumed session costs a fraction of the original context.
+   */
+  async compressedTranscript(id: string, keepLast = 6): Promise<ChatMessage[]> {
+    const { messages } = await this.transcript(id);
+    if (messages.length <= keepLast + 1) return messages;
+    const first = messages[0]!;
+    const tail = messages.slice(-keepLast);
+    const middle = messages.slice(1, -keepLast);
+    const summary: ChatMessage = {
+      role: 'user',
+      content: `[Resumed session context compressed: ${middle.length} earlier message(s) summarized. ` +
+        middle.map((m) => `[${m.role}${m.name ? `:${m.name}` : ''}] ${m.content.slice(0, 120).replace(/\s+/g, ' ')}`).join(' | ') + `
+Continue from here.]`,
+    };
+    return [first, summary, ...tail];
   }
 
   /** Full transcript for `operator history <id>`. */

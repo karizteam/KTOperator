@@ -16,6 +16,7 @@ import { FallbackProvider, type FallbackEntry, type FallbackEvent } from '../pro
 import type { AIProvider } from '../providers/interfaces/types.js';
 import type { ProviderProfile } from '../config/schema.js';
 import type { InstructionFile } from '../core/agent/instructions.js';
+import type { WorkspaceDoc } from '../core/agent/workspace-state.js';
 
 export interface CliGlobals {
   json: boolean;
@@ -37,6 +38,11 @@ export class Runtime {
    * Session state, not config: it is re-derived from the workspace each time.
    */
   projectInstructions: InstructionFile[] = [];
+  /**
+   * Approved .operator/ skills & prompts for this session. Session state,
+   * like projectInstructions — re-derived from the workspace each console.
+   */
+  workspaceDocs: WorkspaceDoc[] = [];
   private boundary: WorkspaceBoundary | null | undefined; // undefined = not tried
   /** Long-lived command that wants to own Ctrl+C (the interactive console). */
   private interruptListener: (() => void) | null = null;

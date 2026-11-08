@@ -10,6 +10,10 @@
 export interface UsageTotals {
   promptTokens: number;
   completionTokens: number;
+  /** Prompt tokens served from provider prompt cache (cheaper). */
+  cachedTokens: number;
+  /** Model requests counted. */
+  requests: number;
   /** Sum of provider-reported cost. Zero means "not reported", not "free". */
   costUsd: number;
 }
@@ -18,17 +22,45 @@ export interface UsageDelta {
   promptTokens?: number | undefined;
   completionTokens?: number | undefined;
   costUsd?: number | undefined;
+  cachedTokens?: number | undefined;
 }
 
 export function emptyTotals(): UsageTotals {
-  return { promptTokens: 0, completionTokens: 0, costUsd: 0 };
+  return { promptTokens: 0, completionTokens: 0, cachedTokens: 0, requests: 0, costUsd: 0 };
 }
 
 export function addUsage(total: UsageTotals, usage: UsageDelta | undefined): void {
   if (usage === undefined) return;
   total.promptTokens += usage.promptTokens ?? 0;
   total.completionTokens += usage.completionTokens ?? 0;
+  total.cachedTokens += usage.cachedTokens ?? 0;
+  if ((usage.promptTokens ?? 0) > 0 || (usage.completionTokens ?? 0) > 0) total.requests += 1;
   total.costUsd += usage.costUsd ?? 0;
+}
+
+/** Cached share of prompt tokens, 0–100. */
+export function cacheHitRate(total: UsageTotals): number {
+  if (total.promptTokens <= 0) return 0;
+  return Math.min(100, Math.max(0, (total.cachedTokens / total.promptTokens) * 100));
+}
+
+/**
+ * Human-readable breakdown used by /usage, /status and `operator usage`.
+ * Pure so tests can assert the numbers without a terminal.
+ */
+export function usageSummaryLines(total: UsageTotals, options: { tokenBudget?: number | undefined; contextTokens?: number | undefined; costCapUsd?: number | undefined } = {}): string[] {
+  const lines: string[] = [];
+  lines.push(`tokens       ${formatTokens(total.promptTokens)} in · ${formatTokens(total.completionTokens)} out · ${formatTokens(totalTokens(total))} total`);
+  if (total.cachedTokens > 0) lines.push(`cached       ${formatTokens(total.cachedTokens)} prompt tokens from cache (${cacheHitRate(total).toFixed(0)}% hit rate)`);
+  lines.push(`cost         ${total.costUsd > 0 ? formatCost(total.costUsd) : 'not reported by provider'}`);
+  if (options.costCapUsd !== undefined && total.costUsd > 0) lines.push(`cost cap     ${formatCost(options.costCapUsd)} · ${formatCost(Math.max(0, options.costCapUsd - total.costUsd))} remaining`);
+  lines.push(`requests     ${total.requests}`);
+  if (options.contextTokens !== undefined) {
+    const budget = options.tokenBudget ?? 30_000;
+    const pct = budget > 0 ? Math.min(100, Math.round((options.contextTokens / budget) * 100)) : 0;
+    lines.push(`context      ~${formatTokens(options.contextTokens)} of ${formatTokens(budget)} budget (${pct}% used)`);
+  }
+  return lines;
 }
 
 export function totalTokens(total: UsageTotals): number {

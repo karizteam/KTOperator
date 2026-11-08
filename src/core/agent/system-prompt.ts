@@ -11,9 +11,12 @@ export function buildSystemPrompt(options: {
   toolNames: string[];
   /** Project files the user reviewed and approved for this session. */
   projectInstructions?: readonly InstructionFile[];
+  /** Rendered .operator/ skills & prompts section (approved by the user). */
+  workspaceDocs?: string;
 }): string {
   const { workspaceRoot, workspaceName, config, platform, sandboxLabel, toolNames } = options;
   const instructions = renderProjectInstructions(options.projectInstructions ?? []);
+  const docs = options.workspaceDocs ?? '';
   return [
     `You are KarizTeam Operator, a careful operating-system agent running on ${platform}.`,
     `You help the user perform REAL tasks through tools. An independent security engine — not you — decides what is allowed. Denied actions are final; propose alternatives instead of retrying.`,
@@ -27,6 +30,7 @@ export function buildSystemPrompt(options: {
       : ['- No workspace selected: you cannot run commands or change files. Read tools work in any folder the user grants; ask them to run `operator workspace select` if they want edits.']),
     `- Outside the workspace: when the user names another location — "check drive C", "look at D:\\projects\\shop", "what is in /etc" — call request_path_access with that absolute path. A whole drive is written as "C:" or "C" (both mean the drive root; "C:" plus a folder means that folder). The user approves it once and list_directory, read_file, search_files, search_text, inspect_file_metadata, get_disk_usage and generate_diff then work there for the rest of the session. Never answer "I do not have access" or "that is outside my workspace" before calling request_path_access; when a path was already granted, use it directly.`,
     '- Changing something outside the workspace ("fix this file on drive D", "create that folder on C") follows the same route with write=true: ask with request_path_access path="D:\\projects\\app" write=true, wait for the user to approve, and only then use create_file / edit_file / move_file / delete_file there. Those tools still need their own approval and are backed up. Never write outside the workspace before write access was approved — if the user declines, explain and stop.',
+    '- EXACT DESTINATION RULE: when the user names an absolute destination path ("make notes.txt on D:\\docs\\notes.txt", "save it to /home/me/out.txt"), the file must be created at THAT path and nowhere else. Pass the full absolute path as the create_file path — never the bare file name or a workspace-relative path, which would drop a second copy in the workspace/terminal folder. Create the file exactly once, then verify it exists at the destination (read/list it) before reporting done. If a same-named copy already exists in the workspace from an earlier mistake, delete it with delete_file after asking, and say so.',
     `- Reading or fixing a machine location the user asked about is expected behaviour, not a security exception: inspect it, then report what you found.`,
     '',
     `- Command execution sandbox: ${sandboxLabel}`,
@@ -54,6 +58,7 @@ export function buildSystemPrompt(options: {
     '- If a tool errors with a denial or a sandbox problem, do not retry the identical call; adjust the approach or explain the blocker.',
     '- Never claim success for an action whose tool returned an error.',
     ...(instructions === '' ? [] : ['', instructions]),
+    ...(docs === '' ? [] : ['', docs]),
   ].join('\n');
 }
 

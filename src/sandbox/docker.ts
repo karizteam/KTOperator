@@ -59,7 +59,7 @@ export class DockerBackend implements SandboxBackend {
       id: this.id,
       label: this.label,
       available: imagePresent,
-      ...(imagePresent ? {} : { reason: `Sandbox image "${this.config.sandbox.image}" is not pulled. Run: docker pull ${this.config.sandbox.image}` }),
+      ...(imagePresent ? {} : { reason: `Sandbox image "${this.config.sandbox.image}" is not pulled${this.config.sandbox.autoPull ? ' — it will be pulled automatically on first use' : `. Run: docker pull ${this.config.sandbox.image}`}` }),
       capabilities: caps,
       limitations: ['Image tag is user-configurable; keep it minimal and pinned.'],
     };
@@ -93,11 +93,20 @@ export class DockerBackend implements SandboxBackend {
     return args;
   }
 
+  /** Pull the sandbox image on first use when autoPull is enabled. */
+  async ensureImage(): Promise<void> {
+    if (!this.config.sandbox.autoPull) return;
+    if (probe('docker', ['image', 'inspect', this.config.sandbox.image], 10_000)) return;
+    if (!probe('docker', ['--version'])) return;
+    probe('docker', ['pull', this.config.sandbox.image], 180_000);
+  }
+
   async run(spec: SandboxExecSpec): Promise<ManagedProcessResult> {
     // Guard first: the agent must never see the docker socket, regardless of availability.
     if (spec.argv.some((a) => a.includes('/var/run/docker.sock'))) {
       throw new SandboxError('execution', 'Refusing to expose the container runtime socket to the sandbox.');
     }
+    await this.ensureImage();
     const status = await this.status();
     if (!status.available) {
       throw new SandboxError('unavailable', `Docker sandbox is not available: ${status.reason ?? 'unknown reason'}`, {

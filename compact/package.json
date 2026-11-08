@@ -1,0 +1,8 @@
+{
+  "name": "ktoperator-compact",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": { "ktoperator-compact": "operator.mjs" },
+  "scripts": { "test": "node --test test.mjs", "start": "node operator.mjs" },
+  "engines": { "node": ">=22.12.0" }
+}

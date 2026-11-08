@@ -15,7 +15,7 @@ describe('usage accounting', () => {
     addUsage(total, { promptTokens: 1200, completionTokens: 300, costUsd: 0.0021 });
     addUsage(total, { promptTokens: 800, completionTokens: 200 });
     addUsage(total, undefined);
-    assert.deepEqual(total, { promptTokens: 2000, completionTokens: 500, costUsd: 0.0021 });
+    assert.deepEqual(total, { promptTokens: 2000, completionTokens: 500, cachedTokens: 0, requests: 2, costUsd: 0.0021 });
   });
 
   it('keeps small amounts precise instead of rounding them to zero', () => {
@@ -31,8 +31,8 @@ describe('usage accounting', () => {
 
   it('shows cost when it is known and tokens when it is not', () => {
     assert.equal(usageLabel(emptyTotals()), '');
-    assert.equal(usageLabel({ promptTokens: 1500, completionTokens: 500, costUsd: 0 }), '2.0k tok');
-    assert.equal(usageLabel({ promptTokens: 1500, completionTokens: 500, costUsd: 0.031 }), '$0.031');
+    assert.equal(usageLabel({ promptTokens: 1500, completionTokens: 500, cachedTokens: 0, requests: 1, costUsd: 0 }), '2.0k tok');
+    assert.equal(usageLabel({ promptTokens: 1500, completionTokens: 500, cachedTokens: 0, requests: 1, costUsd: 0.031 }), '$0.031');
   });
 });
 

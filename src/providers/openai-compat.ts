@@ -227,11 +227,17 @@ export function parseWireCompletion(json: Record<string, unknown>): ChatResult {
 
 function normalizeUsage(raw: Record<string, unknown>): Usage {
   const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+  // Prompt caching: OpenAI/OpenRouter serve the stable prefix (system prompt +
+  // tool definitions) from cache automatically when it is unchanged — the
+  // cheapest tokens in the request. Report them so cost accounting is honest.
+  const details = raw['prompt_tokens_details'] as Record<string, unknown> | undefined;
+  const cached = num(details?.['cached_tokens']) ?? num(raw['cached_tokens']);
   return {
     ...(num(raw['prompt_tokens']) !== undefined ? { promptTokens: num(raw['prompt_tokens']) } : {}),
     ...(num(raw['completion_tokens']) !== undefined ? { completionTokens: num(raw['completion_tokens']) } : {}),
     ...(num(raw['total_tokens']) !== undefined ? { totalTokens: num(raw['total_tokens']) } : {}),
     ...(num(raw['cost']) !== undefined ? { costUsd: num(raw['cost']) } : {}),
+    ...(cached !== undefined ? { cachedTokens: cached } : {}),
   };
 }
 

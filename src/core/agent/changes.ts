@@ -182,6 +182,29 @@ const GROUPS: { kind: ChangeKind; title: string }[] = [
 
 const TARGET_WIDTH = 52;
 
+/** The action word (padded to align the target column) in the icon's color. */
+function actionWord(ui: Ui, action: string): string {
+  const padded = action.padEnd(9);
+  switch (action) {
+    case 'created':
+      return ui.green(padded);
+    case 'modified':
+    case 'moved':
+      return ui.yellow(padded);
+    case 'deleted':
+      return ui.red(padded);
+    case 'opened':
+      return ui.brandLight(padded);
+    case 'closed':
+      return ui.yellow(padded);
+    case 'ran':
+    case 'started':
+      return ui.brand(padded);
+    default:
+      return padded;
+  }
+}
+
 function icon(ui: Ui, action: string): string {
   switch (action) {
     case 'created':
@@ -217,7 +240,7 @@ export function renderChangesBox(ui: Ui, changes: readonly RunChange[]): void {
       const count = item.count > 1 && group.kind !== 'folder' && group.kind !== 'file' ? ui.dim(` ×${item.count}`) : '';
       const detail = item.detail !== undefined ? ui.dim(` · ${item.detail}`) : '';
       const target = truncateToWidth(item.target, TARGET_WIDTH);
-      lines.push(`  ${icon(ui, item.action)} ${item.action.padEnd(9)} ${target}${count}${detail}`);
+      lines.push(`  ${icon(ui, item.action)} ${actionWord(ui, item.action)} ${target}${count}${detail}`);
     }
   }
   ui.info('');

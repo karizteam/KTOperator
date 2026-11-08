@@ -10,7 +10,7 @@ import { modelList } from './commands/model.js';
 import { providerAdd, providerList, providerRemove, providerTest } from './commands/provider.js';
 import { backupsList, rollback } from './commands/rollback.js';
 import { sandboxStatus } from './commands/sandbox.js';
-import { history, sessionList } from './commands/session.js';
+import { history, sessionDelete, sessionExport, sessionList, usage } from './commands/session.js';
 import { workspaceSelect, workspaceShow } from './commands/workspace.js';
 import { isOperatorError, OperatorError, UserCancelledError } from './errors/errors.js';
 import { PRODUCT_NAME, VERSION } from './version.js';
@@ -90,9 +90,9 @@ program
   .action(handle(async (rt) => init(rt)));
 
 program
-  .command('chat')
-  .description('Open the interactive console (provider → key → model → chatbox). This is the default when ktoperator runs with no command.')
-  .action(handle(async (rt) => consoleMain(rt)));
+  .command('chat [sessionId]')
+  .description('Open the interactive console (provider → key → model → chatbox). With a session id, resume that chat. This is the default when ktoperator runs with no command.')
+  .action(handle(async (rt, sessionId?: string) => consoleMain(rt, sessionId ? { resumeSessionId: sessionId } : {})));
 
 program
   .command('doctor')
@@ -141,7 +141,8 @@ provider
   .action(handle(async (rt, id?: string) => providerTest(rt, id)));
 provider
   .command('remove <id>')
-  .description('Remove a provider profile and any stored credentials')
+  .alias('delete')
+  .description('Delete a provider profile and any stored credentials (alias: delete)')
   .action(handle(async (rt, id: string) => providerRemove(rt, id)));
 
 const model = program.command('model').description('Model discovery');
@@ -169,12 +170,14 @@ program
   .option('--yes [level]', 'auto-approve up to a tier: read | write | all (use with care; audited)')
   .option('--dry-run', 'simulate actions without modifying anything')
   .option('--max-steps <n>', 'iteration cap for this run', (v) => Number(v))
+  .option('--token-budget <n>', 'context token budget for this run (overrides limits.tokenBudget)', (v) => Number(v))
   .action(handle(async (rt, taskWords: string[], opts: Record<string, unknown>) => runTask(rt, requireTask(taskWords.join(' ')), {
     provider: opts['provider'] as string | undefined,
     model: opts['model'] as string | undefined,
     yes: opts['yes'] as string | boolean | undefined,
     dryRun: opts['dryRun'] as boolean | undefined,
     maxSteps: opts['maxSteps'] as number | undefined,
+    tokenBudget: opts['tokenBudget'] as number | undefined,
   })));
 
 program
@@ -193,6 +196,20 @@ session
   .description('List recent sessions')
   .option('--limit <n>', 'max sessions', (v) => Number(v), 20)
   .action(handle(async (rt, opts: { limit: number }) => sessionList(rt, opts.limit)));
+session
+  .command('delete <id>')
+  .description('Permanently delete a previous session by id (or id prefix)')
+  .action(handle(async (rt, id: string) => sessionDelete(rt, id)));
+session
+  .command('export <id>')
+  .description('Export a session as a Markdown transcript (stdout, or --out <file>)')
+  .option('--out <file>', 'write the transcript to this file instead of stdout')
+  .action(handle(async (rt, id: string, opts: { out?: string }) => sessionExport(rt, id, opts.out)));
+
+program
+  .command('usage [sessionId]')
+  .description('Token, cache and cost breakdown for one session, or totals across all sessions')
+  .action(handle(async (rt, sessionId: string | undefined) => usage(rt, sessionId)));
 
 program
   .command('history [sessionId]')
@@ -241,6 +258,7 @@ Guiding principle: the AI decides what it wants to do; ktOperator's security eng
 
 Typical use:
   ktoperator                          # interactive console: pick provider, enter key, pick model, chat
+  ktoperator 74c48d0d-…                # resume that chat (id from the Goodbye message)
   ktoperator run "Analyze this project"   # one-shot agent task
   ktoperator doctor                   # environment diagnostics
 
@@ -252,12 +270,21 @@ Security notes:
 );
 
 // Bare invocation (nothing but optional global flags) opens the interactive console.
+// A single non-command argument is a session id: `ktoperator 74c48d0d-…`
+// resumes that chat (what the Goodbye message tells the user to type).
+// Session ids are UUIDs, so they can never collide with a command name.
 const globalOnlyFlags = new Set(['--json', '--no-color']);
-const argsOnlyGlobals = process.argv.slice(2).every((a) => globalOnlyFlags.has(a));
+const bareArgs = process.argv.slice(2).filter((a) => !globalOnlyFlags.has(a));
+const KNOWN_COMMANDS = new Set([
+  'init', 'chat', 'doctor', 'provider', 'model', 'workspace', 'run', 'plan',
+  'session', 'usage', 'history', 'sandbox', 'config', 'backups', 'rollback', 'help',
+]);
+const resumeArg = bareArgs.length === 1 && !bareArgs[0]!.startsWith('-') && !KNOWN_COMMANDS.has(bareArgs[0]!) ? bareArgs[0]! : undefined;
+const argsOnlyGlobals = bareArgs.length === 0;
 
-if (argsOnlyGlobals) {
+if (argsOnlyGlobals || resumeArg !== undefined) {
   program.parseOptions(process.argv);
-  await handle(async (rt) => consoleMain(rt))();
+  await handle(async (rt) => consoleMain(rt, resumeArg ? { resumeSessionId: resumeArg } : {}))();
 } else {
   // Commander throws on unknown commands/options by default; keep that behavior.
   await program.parseAsync(process.argv).catch((err: unknown) => {

@@ -134,8 +134,17 @@ export async function providerRemove(rt: Runtime, id: string): Promise<void> {
   rt.config = await rt.store.update((config) => {
     config.providers = config.providers.filter((p) => p.id !== id);
     if (config.defaultProvider === id) {
-      config.defaultProvider = config.providers[0]?.id;
-      if (config.defaultProvider === undefined) delete config.defaultProvider;
+      const next = config.providers[0];
+      if (next) {
+        config.defaultProvider = next.id;
+        // The old default model belonged to the deleted profile — do not
+        // leave a dangling defaultModel pointing at a model nobody serves.
+        if (next.model) config.defaultModel = next.model;
+        else delete config.defaultModel;
+      } else {
+        delete config.defaultProvider;
+        delete config.defaultModel;
+      }
     }
   });
   rt.ui.emit({ removed: id }, () => '');

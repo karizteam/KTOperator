@@ -295,11 +295,71 @@ export const runBuildTool = makeScriptRunner(
   'Run the project build script inside the sandbox. Requires an npm "build" script.',
 );
 
+/** Shared git helper: runs git in the sandbox, writable, workspace as cwd. */
+async function gitRun(ctx: ToolContext, args: string[]): Promise<ToolResult> {
+  try { await fs.access(path.join(ctx.workspace!.root, '.git')); }
+  catch { return { ok: false, summary: 'Workspace is not a git repository.', error: 'No .git directory at the workspace root.' }; }
+  const spec = await sandboxSpec(ctx, ['git', ...args], { writable: true, timeoutMs: 30_000 });
+  await ctx.audit.record({ event: 'command.execute', tool: 'git', tier: 2, detail: { argv: spec.argv, sandbox: ctx.sandbox.selectedId() } });
+  const result = await ctx.sandbox.execute(spec);
+  const out = (result.stdout + result.stderr).trim().slice(0, 4000);
+  return {
+    ok: result.exitCode === 0,
+    summary: `git ${args[0]}: exit ${result.exitCode ?? 'killed'}.`,
+    data: { output: out },
+    ...(result.exitCode !== 0 ? { error: out.slice(0, 300) || `git ${args[0]} failed` } : {}),
+  };
+}
+
+export const gitCommitTool: Tool = {
+  name: 'git_commit',
+  description: 'Stage all changes and commit them with a message, inside the sandbox. Destructive-ish: creates a commit (reversible via git reset). Requires approval.',
+  requiresWorkspace: true,
+  schema: { type: 'object', additionalProperties: false, required: ['message'], properties: { message: { type: 'string', minLength: 1, maxLength: 500 } } },
+  describe: (input) => ({ summary: `git commit: ${String(input['message']).slice(0, 100)}`, targets: ['.git'] }),
+  async run(input, ctx) {
+    const message = input['message'] as string;
+    const add = await gitRun(ctx, ['add', '-A']);
+    if (!add.ok) return add;
+    return gitRun(ctx, ['commit', '-m', message]);
+  },
+};
+
+export const gitBranchTool: Tool = {
+  name: 'git_branch',
+  description: 'List branches, create a branch, or switch branches inside the sandbox. Requires approval for create/switch.',
+  requiresWorkspace: true,
+  schema: { type: 'object', additionalProperties: false, properties: { op: { type: 'string', enum: ['list', 'create', 'switch'] }, name: { type: 'string', maxLength: 200 } } },
+  describe: (input) => ({ summary: `git branch ${String(input['op'] ?? 'list')}${input['name'] ? ` ${String(input['name'])}` : ''}`, targets: ['.git'] }),
+  async run(input, ctx) {
+    const op = (input['op'] as string | undefined) ?? 'list';
+    const name = input['name'] as string | undefined;
+    if (op === 'list') return gitRun(ctx, ['branch', '-a']);
+    if (!name) return { ok: false, summary: 'branch name required', error: 'Pass name for create/switch.' };
+    return gitRun(ctx, op === 'create' ? ['branch', name] : ['switch', name]);
+  },
+};
+
+export const gitStashTool: Tool = {
+  name: 'git_stash',
+  description: 'Stash changes (push), list stashes, or pop the latest stash inside the sandbox. Requires approval.',
+  requiresWorkspace: true,
+  schema: { type: 'object', additionalProperties: false, properties: { op: { type: 'string', enum: ['push', 'list', 'pop'] } } },
+  describe: (input) => ({ summary: `git stash ${String(input['op'] ?? 'push')}`, targets: ['.git'] }),
+  async run(input, ctx) {
+    const op = (input['op'] as string | undefined) ?? 'push';
+    return gitRun(ctx, op === 'list' ? ['stash', 'list'] : op === 'pop' ? ['stash', 'pop'] : ['stash', 'push', '-m', 'operator stash']);
+  },
+};
+
 export const developmentTools: Tool[] = [
   inspectProjectTool,
   detectProjectTypeTool,
   inspectPackageJsonTool,
   inspectGitStatusTool,
+  gitCommitTool,
+  gitBranchTool,
+  gitStashTool,
   runTestsTool,
   runTypecheckTool,
   runLinterTool,

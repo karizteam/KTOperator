@@ -426,6 +426,34 @@ export const generateDiffTool: Tool = {
 /* Mutating tools (approval + backup handled by registry / helpers)    */
 /* ------------------------------------------------------------------ */
 
+/**
+ * Whitespace-tolerant fallback for edit_file: match `find` line-by-line with
+ * each line trimmed and internal runs of whitespace collapsed. Returns the
+ * [start, end) range in the original text, or null when no fuzzy match.
+ */
+export function findFuzzy(text: string, find: string): { start: number; end: number } | null {
+  const norm = (s: string) => s.trim().replace(/\s+/g, ' ');
+  const textLines = text.split('\n');
+  const findLines = find.split('\n').map(norm);
+  if (findLines.length === 0 || findLines.every((l) => l === '')) return null;
+  // Byte offset of each line start.
+  const offsets: number[] = [];
+  let off = 0;
+  for (const l of textLines) { offsets.push(off); off += l.length + 1; }
+  for (let i = 0; i + findLines.length <= textLines.length; i++) {
+    let ok = true;
+    for (let j = 0; j < findLines.length; j++) {
+      if (norm(textLines[i + j]!) !== findLines[j]) { ok = false; break; }
+    }
+    if (ok) {
+      const start = offsets[i]!;
+      const last = i + findLines.length - 1;
+      return { start, end: offsets[last]! + textLines[last]!.length };
+    }
+  }
+  return null;
+}
+
 async function writeVerified(absPath: string, content: string, rel: string): Promise<void> {
   await fs.mkdir(path.dirname(absPath), { recursive: true });
   const tmp = `${absPath}.operator-tmp-${process.pid}`;
@@ -442,7 +470,7 @@ async function writeVerified(absPath: string, content: string, rel: string): Pro
 export const createFileTool: Tool = {
   name: 'create_file',
   description:
-    'Create a new file with given content: inside the workspace, or in a folder the user granted write access to with request_path_access. Requires approval; overwriting an existing file escalates to a destructive approval.',
+    'Create a new file with given content: inside the workspace, or in a folder the user granted write access to with request_path_access. If the user named an absolute destination path, path MUST be that exact absolute path — never a bare name or workspace-relative path (that creates a duplicate copy in the workspace). Requires approval; overwriting an existing file escalates to a destructive approval.',
   requiresWorkspace: true,
   workspaceOptional: true,
   schema: {
@@ -560,11 +588,13 @@ export const editFileTool: Tool = {
     let updated = original;
     let missing = false;
     for (const { find, replace, all } of edits) {
-      if (!updated.includes(find)) {
-        missing = true;
-        break;
+      if (updated.includes(find)) {
+        updated = all ? updated.split(find).join(replace) : updated.replace(find, replace);
+        continue;
       }
-      updated = all ? updated.split(find).join(replace) : updated.replace(find, replace);
+      const hit = findFuzzy(updated, find);
+      if (!hit) { missing = true; break; }
+      updated = updated.slice(0, hit.start) + replace + updated.slice(hit.end);
     }
     if (missing) {
       const listed = edits.map((e, i) => `${i + 1}. find: ${JSON.stringify(e.find.slice(0, 120))}`).join('\n');
@@ -581,14 +611,21 @@ export const editFileTool: Tool = {
     const edits = input['edits'] as { find: string; replace: string; all?: boolean }[];
     let updated = original;
     const applied: number[] = [];
+    let fuzzyUsed = false;
     for (let i = 0; i < edits.length; i++) {
       const { find, replace, all } = edits[i]!;
-      if (!updated.includes(find)) {
-        throw new ToolExecutionError('edit_file', `Edit #${i + 1}: "find" text not found in ${rel}. No changes were written.`, {
-          hint: 'Re-read the file to get the exact current text (whitespace matters).',
-        });
+      if (updated.includes(find)) {
+        updated = all ? updated.split(find).join(replace) : updated.replace(find, replace);
+      } else {
+        const hit = findFuzzy(updated, find);
+        if (!hit) {
+          throw new ToolExecutionError('edit_file', `Edit #${i + 1}: "find" text not found in ${rel}. No changes were written.`, {
+            hint: 'Re-read the file to get the exact current text.',
+          });
+        }
+        fuzzyUsed = true;
+        updated = updated.slice(0, hit.start) + replace + updated.slice(hit.end);
       }
-      updated = all ? updated.split(find).join(replace) : updated.replace(find, replace);
       applied.push(i + 1);
     }
     if (updated === original) {
@@ -598,7 +635,7 @@ export const editFileTool: Tool = {
     if (ctx.dryRun) return { ok: true, summary: `[dry-run] would apply ${applied.length} edit(s) to ${rel}.`, data: { diff } };
     await ctx.backups.backup(ctx.sessionId, entry.realPath, 'edit', { audit: ctx.audit });
     await writeVerified(entry.realPath, updated, rel);
-    return { ok: true, summary: `Applied ${applied.length} edit(s) to ${rel} and verified the result.`, data: { diff } };
+    return { ok: true, summary: `Applied ${applied.length} edit(s) to ${rel} and verified the result.${fuzzyUsed ? ' (one edit matched with whitespace tolerance)' : ''}`, data: { diff } };
   },
 };
 
@@ -682,6 +719,56 @@ export const deleteFileTool: Tool = {
   },
 };
 
+export const deleteDirectoryTool: Tool = {
+  name: 'delete_directory',
+  description:
+    'Recursively delete a directory inside the workspace (or a write-granted folder) after destructive approval. Every file inside is snapshotted first (up to 500 files / 50MB); the workspace root and .git are never deleted. Dry-run lists what would go.',
+  requiresWorkspace: true,
+  workspaceOptional: true,
+  schema: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['path'],
+    properties: { path: { type: 'string', description: 'Workspace-relative directory path.', minLength: 1, maxLength: 1024 } },
+  },
+  async describe(input, ctx) {
+    const rel = input['path'] as string;
+    let count = 0;
+    try {
+      const entry = await resolveWrite(ctx, rel);
+      if (entry.kind === 'directory') {
+        const files: string[] = [];
+        await walk((p) => resolveWrite(ctx, p), rel, { maxResults: 501, includeHidden: true, onEntry: (_r, _a, isDir) => { if (!isDir) files.push(_r); } });
+        count = files.length;
+      }
+    } catch { /* preview is best effort */ }
+    return { summary: `DELETE directory ${rel} recursively (${count} file(s) inside)`, targets: [rel] };
+  },
+  async run(input, ctx) {
+    const rel = input['path'] as string;
+    const entry = await resolveWrite(ctx, rel);
+    if (entry.kind !== 'directory') throw new PathSecurityError(`Not a directory: ${rel}`);
+    if (entry.relativePath === '.' || entry.relativePath === '') throw new PathSecurityError('Refusing to delete the workspace root.');
+    const base = rel.split('/').pop()?.toLowerCase();
+    if (base === '.git') throw new PathSecurityError('Refusing to delete .git.');
+    const files: string[] = [];
+    await walk((p) => resolveWrite(ctx, p), rel, { maxResults: 501, includeHidden: true, onEntry: (r, _a, isDir) => { if (!isDir) files.push(r); } });
+    if (files.length > 500) throw new ToolExecutionError('delete_directory', `Directory contains more than 500 files (${files.length}+); refusing. Delete in smaller pieces.`);
+    if (ctx.dryRun) return { ok: true, summary: `[dry-run] would delete directory ${entry.relativePath} with ${files.length} file(s).` };
+    let totalBytes = 0;
+    for (const f of files) {
+      const fe = await resolveWrite(ctx, f);
+      totalBytes += fe.size ?? 0;
+      if (totalBytes > 50 * 1024 * 1024) throw new ToolExecutionError('delete_directory', 'Directory exceeds the 50MB snapshot limit; refusing.');
+      await ctx.backups.backup(ctx.sessionId, fe.realPath, 'delete', { audit: ctx.audit });
+    }
+    await fs.rm(entry.realPath, { recursive: true, force: true });
+    const gone = await fs.access(entry.realPath).then(() => false, () => true);
+    if (!gone) throw new ToolExecutionError('delete_directory', `Directory still exists after delete: ${entry.relativePath}`);
+    return { ok: true, summary: `Deleted directory ${entry.relativePath} (${files.length} file(s) snapshotted for rollback).` };
+  },
+};
+
 export const filesystemTools: Tool[] = [
   listDirectoryTool,
   readFileTool,
@@ -692,5 +779,6 @@ export const filesystemTools: Tool[] = [
   editFileTool,
   moveFileTool,
   deleteFileTool,
+  deleteDirectoryTool,
   generateDiffTool,
 ];

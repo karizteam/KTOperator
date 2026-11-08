@@ -35,7 +35,7 @@ export default defineConfig(
   },
   {
     // Plain Node scripts.
-    files: ['scripts/**/*.mjs', 'preview/**/*.mjs'],
+    files: ['scripts/**/*.mjs', 'preview/**/*.mjs', 'compact/**/*.mjs'],
     languageOptions: {
       ecmaVersion: 2024,
       sourceType: 'module',
@@ -44,11 +44,16 @@ export default defineConfig(
         console: 'readonly',
         URL: 'readonly',
         Buffer: 'readonly',
+        fetch: 'readonly',
+        TextDecoder: 'readonly',
         setTimeout: 'readonly',
         clearTimeout: 'readonly',
         setInterval: 'readonly',
         clearInterval: 'readonly',
       },
+    },
+    rules: {
+      'no-empty': ['error', { allowEmptyCatch: true }],
     },
   },
 );

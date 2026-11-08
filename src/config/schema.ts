@@ -78,19 +78,25 @@ export const configSchema = z.object({
       allowRestrictedProcessFallback: z.boolean().default(false),
       /** Highest tier `--yes` may auto-approve. Tier 3 never auto-approves here. */
       maxAutoApproveTier: z.number().int().min(0).max(2).default(1),
+      /** Per-tool overrides: deny a tool outright, or force approval even for tier 0. */
+      toolPolicies: z.record(z.string(), z.enum(['allow', 'approve', 'deny'])).default({}),
+      /** Refuse writes whose content looks like a live secret (default on). */
+      blockSecretWrites: z.boolean().default(true),
     })
-    .default({ allowRestrictedProcessFallback: false, maxAutoApproveTier: 1 }),
+    .default({ allowRestrictedProcessFallback: false, maxAutoApproveTier: 1, toolPolicies: {}, blockSecretWrites: true }),
   sandbox: z
     .object({
       backend: z.enum(['auto', 'docker', 'restricted']).default('auto'),
       image: z.string().default('node:22-alpine'),
+      /** Pull the sandbox image automatically when it is missing (default on). */
+      autoPull: z.boolean().default(true),
       network: z.boolean().default(false),
       memoryMb: z.number().int().min(64).max(65536).default(512),
       cpus: z.number().min(0.25).max(32).default(1),
       pidsLimit: z.number().int().min(16).max(4096).default(128),
       writableDefault: z.boolean().default(false),
     })
-    .default({ backend: 'auto', image: 'node:22-alpine', network: false, memoryMb: 512, cpus: 1, pidsLimit: 128, writableDefault: false }),
+    .default({ backend: 'auto', image: 'node:22-alpine', autoPull: true, network: false, memoryMb: 512, cpus: 1, pidsLimit: 128, writableDefault: false }),
   network: z
     .object({
       /** Allow provider base URLs that resolve to private/loopback addresses. */
@@ -107,6 +113,10 @@ export const configSchema = z.object({
       maxProcesses: z.number().int().min(1).max(64).default(8),
       maxProviderRetries: z.number().int().min(0).max(10).default(3),
       maxTokens: z.number().int().min(256).max(200_000).optional(),
+      /** Token budget for the model context (chars/4 estimate); older turns compress first. */
+      tokenBudget: z.number().int().min(1000).max(500_000).default(30_000),
+      /** Stop a run when provider-reported cost exceeds this many USD (unset = no cap). */
+      costCapUsd: z.number().positive().optional(),
     })
     .default({
       maxIterations: 12,
@@ -116,6 +126,7 @@ export const configSchema = z.object({
       maxFileBytes: 2 * 1024 * 1024,
       maxProcesses: 8,
       maxProviderRetries: 3,
+      tokenBudget: 30_000,
     }),
   backups: z
     .object({

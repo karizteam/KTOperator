@@ -174,6 +174,24 @@ export interface CommandSuggestion {
   help: string;
 }
 
+/** Max slash-menu rows drawn at once — the menu never pushes the box off screen. */
+export const MAX_MENU_ITEMS = 8;
+
+/**
+ * Pure slash-menu layout: which rows to draw for a given selection.
+ * The selected row is always visible; overflow is reported, never hidden.
+ * Exported so the arithmetic can be tested without a terminal.
+ */
+export function buildSlashMenu(items: readonly CommandSuggestion[], selection: number, maxItems = MAX_MENU_ITEMS): { visible: CommandSuggestion[]; selectedIndex: number; hidden: number; start: number } {
+  if (items.length === 0) return { visible: [], selectedIndex: 0, hidden: 0, start: 0 };
+  const selectedIndex = ((selection % items.length) + items.length) % items.length;
+  if (items.length <= maxItems) return { visible: [...items], selectedIndex, hidden: 0, start: 0 };
+  let start = Math.max(0, Math.min(selectedIndex - Math.floor(maxItems / 2), items.length - maxItems));
+  if (selectedIndex < start) start = selectedIndex;
+  if (selectedIndex >= start + maxItems) start = selectedIndex - maxItems + 1;
+  return { visible: items.slice(start, start + maxItems), selectedIndex, hidden: items.length - maxItems, start };
+}
+
 export interface TextAreaOptions {
   /** Box title (default "you"). */
   title?: string;
@@ -1010,15 +1028,20 @@ export class Ui {
         const items = withFooter ? menuItems() : [];
         if (withFooter) {
           if (items.length > 0) {
-            const nameWidth = Math.min(18, Math.max(...items.map((i) => displayWidth(i.command))) + 2);
+            const menu = buildSlashMenu(items, state.selection);
+            state.selection = menu.selectedIndex;
+            const nameWidth = Math.min(18, Math.max(...menu.visible.map((i) => displayWidth(i.command))) + 2);
             const helpWidth = Math.max(0, width - 4 - nameWidth);
-            items.forEach((item, index) => {
-              const marker = index === state.selection ? this.brandBold('▸') : ' ';
+            lines.push(`  ${this.brandDark('─'.repeat(Math.max(8, width - 6)))}`);
+            lines.push(`  ${this.brandBold(`Commands`)} ${this.dim(`· ${items.length} match${items.length === 1 ? '' : 'es'}`)}`);
+            menu.visible.forEach((item, visibleIndex) => {
+              const index = menu.start + visibleIndex;
+              const marker = index === menu.selectedIndex ? this.brandBold('▸') : ' ';
               const pad = ' '.repeat(Math.max(0, nameWidth - displayWidth(item.command)));
-              const label = index === state.selection ? this.brand(item.command) : this.dim(item.command);
+              const label = index === menu.selectedIndex ? this.brandBold(item.command) : this.dim(item.command);
               lines.push(`  ${marker} ${label}${pad}${this.dim(truncateToWidth(item.help, helpWidth))}`);
             });
-            lines.push(this.dim(`  ${truncateToWidth('↑↓ move · Tab complete · ↵ run · Esc close', width - 2)}`));
+            lines.push(this.dim(`  ${truncateToWidth('↑↓ move (wraps) · Tab complete · ↵ run · Esc close', width - 2)}`));
           } else if (hint !== '') {
             // Never let a long hint wrap: a wrapped line would break cursor math.
             lines.push(`  ${truncateToWidth(hint, width - 2)}`);
@@ -1171,10 +1194,16 @@ export class Ui {
               const chosen = items[Math.min(state.selection, items.length - 1)]!;
               state.value = `${chosen.command} `;
               state.cursor = state.value.length;
-              state.menuDismissed = true;
+              // Keep the menu open: after "/provider " the subcommands
+              // (list/use/add/delete) must show up for the user to pick,
+              // not be typed by hand. Typing a space does the same thing.
+              state.menuDismissed = false;
+              state.selection = 0;
               return render(true);
             }
-            insertText('  ');
+            // No menu item: Tab adds the space and (re)opens the subcommand
+            // menu for two-word commands like "/provider delete".
+            insertText(' ');
             return render(true);
           }
           case 'backspace': {
@@ -1182,12 +1211,20 @@ export class Ui {
             if (len > 0) {
               state.value = state.value.slice(0, state.cursor - len) + state.value.slice(state.cursor);
               state.cursor -= len;
+              // Editing must re-open a dismissed menu, or deleting letters
+              // leaves the user with no suggestions at all.
+              state.menuDismissed = false;
+              state.selection = 0;
             }
             return render(true);
           }
           case 'delete': {
             const len = nextGraphemeLength(state.cursor);
-            if (len > 0) state.value = state.value.slice(0, state.cursor) + state.value.slice(state.cursor + len);
+            if (len > 0) {
+              state.value = state.value.slice(0, state.cursor) + state.value.slice(state.cursor + len);
+              state.menuDismissed = false;
+              state.selection = 0;
+            }
             return render(true);
           }
           case 'left': {
@@ -1212,7 +1249,7 @@ export class Ui {
             const items = menuItems();
             if (items.length > 0) {
               const delta = key.type === 'up' ? -1 : 1;
-              state.selection = Math.max(0, Math.min(state.selection + delta, items.length - 1));
+              state.selection = ((state.selection + delta) % items.length + items.length) % items.length;
               return render(true);
             }
             if (recall(key.type === 'up' ? -1 : 1)) return render(true);

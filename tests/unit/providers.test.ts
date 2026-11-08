@@ -206,7 +206,7 @@ describe('Anthropic adapter', () => {
     assert.equal(result.text, 'answer');
     assert.equal(result.finishReason, 'tool_calls');
     assert.deepEqual(result.toolCalls, [{ id: 't1', name: 'read_file', arguments: '{"path":"x"}' }]);
-    assert.equal(body['system'], 'rules');
+    assert.deepEqual(body['system'], [{ type: 'text', text: 'rules', cache_control: { type: 'ephemeral' } }]);
     const msgs = body['messages'] as { role: string; content: unknown }[];
     assert.equal(msgs[0]!.role, 'user');
     assert.ok(JSON.stringify(msgs[1]).includes('tool_use'));

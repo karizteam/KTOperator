@@ -1,5 +1,5 @@
 import { ApprovalDeniedError, PathSecurityError, ToolExecutionError } from '../errors/errors.js';
-import { wrapUntrusted } from '../security/injection.js';
+import { scanUntrustedText, wrapUntrusted } from '../security/injection.js';
 import { redactText } from '../security/redaction.js';
 import { evaluateTier, TOOL_BASE_TIER, type RiskTier } from '../security/policy.js';
 import { parseToolArguments } from './json-schema.js';
@@ -54,6 +54,28 @@ export class ToolRegistry {
     }
     const input = parsed.value;
 
+    // 1b. Per-tool policy overrides (config security.toolPolicies).
+    const policyOverride = ctx.config.security.toolPolicies[name];
+    if (policyOverride === 'deny') {
+      await ctx.audit.record({ event: 'tool.result', tool: name, decision: 'policy-deny' });
+      return { ok: false, summary: `Action denied (${name})`, error: `Tool ${name} is disabled by configuration (security.toolPolicies). Do not retry; explain the blocker.` };
+    }
+
+    // 1c. Tool-poisoning scan: flag instruction-like text in tool descriptions.
+    const descScan = scanUntrustedText(tool.description);
+    if (descScan.suspicious) {
+      await ctx.audit.record({ event: 'tool.description_flagged', tool: name, detail: { matchedPatterns: descScan.matchedPatterns } });
+    }
+
+    // 1d. Secret-write guard: refuse to persist content that looks like a live secret.
+    if (ctx.config.security.blockSecretWrites && (name === 'create_file' || name === 'edit_file')) {
+      const haystack = [input['content'], ...(Array.isArray(input['edits']) ? (input['edits'] as { replace?: string }[]).map((e) => e.replace) : [])].filter((s): s is string => typeof s === 'string').join('\n');
+      if (haystack && redactText(haystack).redactedCount > 0) {
+        await ctx.audit.record({ event: 'tool.result', tool: name, decision: 'secret-write-blocked' });
+        return { ok: false, summary: `Write blocked: content looks like a live secret (${name})`, error: 'Refusing to write content that matches secret patterns. Remove the credential and use the protected store / environment instead.' };
+      }
+    }
+
     // 2. Workspace (or granted folder) requirement.
     const grantedFolders = ctx.access.list().length > 0;
     if (tool.requiresWorkspace && !ctx.workspace && !(tool.workspaceOptional === true && grantedFolders)) {
@@ -75,8 +97,11 @@ export class ToolRegistry {
       tier = Math.max(baseTier, 2) as RiskTier; // fail safe on escalation errors
     }
 
-    // 4. Policy + approval.
-    const verdict = evaluateTier(tier, ctx.config);
+    // 4. Policy + approval. An explicit 'allow' policy skips the prompt;
+    // an explicit 'approve' policy forces one even for tier 0.
+    let verdict = evaluateTier(tier, ctx.config);
+    if (policyOverride === 'allow') verdict = { decision: 'allow', tier, reason: 'Explicitly allowed by security.toolPolicies.' };
+    else if (policyOverride === 'approve' && verdict.decision === 'allow') verdict = { decision: 'requires-approval', tier, reason: 'Approval forced by security.toolPolicies.' };
     let preview: string | undefined;
     let described: ToolDescription | undefined;
     // The description (and its diff preview) is only needed when the call will
